@@ -1,0 +1,10 @@
+window_size = 50
+emit_interval_secs = 30
+min_enrollment_keystrokes = 2000
+ema_alpha = 0.05
+risk_threshold = 5.0
+risk_k = 1.0
+policy_file = "policy.toml"
+profile_path = "profile.enc"
+log_level = "info"
+ipc_socket = "/tmp/dwell-agent.sock"
