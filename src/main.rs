@@ -167,7 +167,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // Command handler
-    let _profile_cmd = profile.clone();
     let profile_path = config.profile_path.clone();
     let cmd_task = tokio::spawn(async move {
         while let Some(cmd) = cmd_rx.recv().await {
