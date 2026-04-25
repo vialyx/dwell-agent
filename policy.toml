@@ -1,0 +1,8 @@
+[tiers]
+low_max = 40
+med_max = 70
+
+[actions]
+low = ["log"]
+med = ["log", "emit_siem_tag", "trigger_re_verification"]
+high = ["log", "emit_siem_tag", "trigger_step_up", "terminate_session"]
