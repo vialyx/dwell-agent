@@ -2,8 +2,8 @@
 
 CI: see [.github/workflows/ci.yml](.github/workflows/ci.yml)
 
-A production-grade **keystroke-dynamics continuous authentication agent** that builds a behavioural baseline of each user's typing rhythm and emits a real-time risk score.  
-The score can drive policy actions (SIEM tagging, step-up MFA, session termination) without ever logging the keys themselves.
+A Rust **keystroke-dynamics continuous authentication agent** that builds a behavioural baseline of each user's typing rhythm and emits a periodic risk score.  
+The score can drive policy actions (SIEM tagging, step-up MFA, session termination) without ever storing typed characters.
 
 ---
 
@@ -29,9 +29,9 @@ The score can drive policy actions (SIEM tagging, step-up MFA, session terminati
 
 ```
 Keyboard HW
-    │  raw key-down / key-up events (timestamps in ns)
+  │  raw key-down / key-up events (timestamps in ns)
     ▼
-[capture layer]          per-OS module (Linux evdev, macOS stub, Windows stub)
+[capture layer]          per-OS module (Linux evdev, macOS CGEventTap, Windows Raw Input backend)
     │
     ▼  crossbeam channel
 [feature extractor]      sliding window → 9-dimensional feature vector
@@ -72,23 +72,23 @@ No risk scores are emitted until enrollment is complete.
 
 - **Zero key-logging** – only timing metadata is recorded; keycodes are used solely for correction detection.
 - **Encrypted profile** – the behavioural baseline is stored as AES-256-GCM ciphertext.
-- **Continuous scoring** – configurable emit interval (default 30 s) with a sliding window.
-- **Hot-reloadable policy** – edit `policy.toml` in place; changes apply within seconds via filesystem watching.
+- **Continuous scoring** – configurable emit interval (default 30 s) over a sliding event window.
+- **Hot-reloadable policy** – `policy.toml` changes are watched automatically when the file exists at startup, and can also be reloaded manually over IPC.
 - **Structured JSON logging** – `tracing` with `tracing-subscriber` JSON output, ready for log shippers.
-- **Graceful shutdown** – SIGTERM / SIGINT flush the encrypted profile to disk.
+- **Webhook delivery** – optional HTTP `POST` of each `RiskEvent`, with retries and exponential backoff.
+- **Runtime health metrics** – periodic counters for keystrokes, emitted risks, commands, and webhook outcomes.
+- **Graceful shutdown** – SIGTERM / SIGINT flush the encrypted profile to disk on Unix builds.
 - **CI-friendly** – capture failures are non-fatal warnings (expected in headless environments).
 
 ---
 
 ## Platform support
 
-| OS | Keystroke capture | Status |
-|---|---|---|
-| **Linux** | `evdev` (`/dev/input/event*`) | ✅ Production |
-| **macOS** | Accessibility `CGEventTap` | ✅ Implemented (requires Accessibility permission) |
-| **Windows** | Raw Input (`WM_INPUT`) | ✅ Implemented |
-
-On macOS/Windows the agent starts and scores can be injected via the IPC socket for testing.
+| OS | Capture backend | Full agent runtime | Notes |
+|---|---|---|---|
+| **Linux** | `evdev` (`/dev/input/event*`) | ✅ Supported | Requires access to `/dev/input/event*` |
+| **macOS** | Accessibility `CGEventTap` | ✅ Supported | Requires Accessibility permission |
+| **Windows** | Raw Input (`WM_INPUT`) backend in `src/capture/windows.rs` | ⚠️ Not currently a supported top-level runtime target | The current runtime still depends on Unix signals and Unix-domain sockets |
 
 ---
 
@@ -96,8 +96,26 @@ On macOS/Windows the agent starts and scores can be injected via the IPC socket 
 
 ### Prerequisites
 
-- Rust ≥ 1.75 (stable)
+- Stable Rust toolchain
 - Linux: read access to `/dev/input/event*` (usually requires the `input` group or `root`)
+- macOS: grant Accessibility access to the built binary or `cargo run` host process
+
+### Configure
+
+The repository already includes sample config files in place:
+
+- `dwell-agent.toml`
+- `policy.toml`
+
+You can edit them directly, or rely on built-in defaults and only override selected values.
+
+For encrypted profile storage, set `DWELL_PROFILE_KEY` to a 64-character hex string:
+
+```bash
+export DWELL_PROFILE_KEY=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+```
+
+For **local smoke tests only**, you can instead set `allow_insecure_placeholder_key = true` in `dwell-agent.toml`. That uses the hard-coded placeholder key `[0x42; 32]` and must never be used in production.
 
 ### Build
 
@@ -108,15 +126,14 @@ cargo build --release
 ### Run
 
 ```bash
-# copy default configs
-cp dwell-agent.toml.example dwell-agent.toml   # optional, defaults are built-in
-cp policy.toml.example policy.toml             # optional
-
 ./target/release/dwell-agent
 ```
 
-For local smoke tests only, either set `DWELL_PROFILE_KEY` (64 hex chars) or set
-`allow_insecure_placeholder_key = true` in `dwell-agent.toml`.
+Or run from source:
+
+```bash
+cargo run --release
+```
 
 The agent writes structured JSON logs to stdout:
 
@@ -133,6 +150,8 @@ Configuration is loaded in order (later sources override earlier):
 1. Built-in defaults
 2. `dwell-agent.toml` in the working directory
 3. Environment variables prefixed with `DWELL_`
+
+The encryption key is handled separately by `DWELL_PROFILE_KEY`; it is **not** part of the TOML config loader.
 
 | Key | Default | Description |
 |---|---|---|
@@ -153,10 +172,12 @@ Configuration is loaded in order (later sources override earlier):
 | `webhook_timeout_secs` | `5` | HTTP timeout for webhook delivery attempts |
 | `metrics_log_interval_secs` | `60` | Interval for periodic runtime health logs |
 
+`webhook_url = ""` in the checked-in `dwell-agent.toml` effectively disables webhook delivery.
+
 **Environment variable example:**
 
 ```bash
-DWELL_RISK_THRESHOLD=3.0 DWELL_LOG_LEVEL=debug ./dwell-agent
+DWELL_RISK_THRESHOLD=3.0 DWELL_LOG_LEVEL=debug cargo run --release
 ```
 
 ---
@@ -164,7 +185,8 @@ DWELL_RISK_THRESHOLD=3.0 DWELL_LOG_LEVEL=debug ./dwell-agent
 ## Policy
 
 `policy.toml` defines risk tiers and the actions triggered per tier.  
-The file is watched for changes at runtime; no restart is needed.
+If the file exists when the agent starts, it is watched for changes at runtime; no restart is needed.  
+You can also trigger a reload manually with the IPC `reload-policy` command.
 
 ```toml
 [tiers]
@@ -192,7 +214,7 @@ high = ["log", "emit_siem_tag", "trigger_step_up", "terminate_session"]
 
 ## IPC / streaming API
 
-Connect to the UNIX socket to receive a **newline-delimited JSON stream** of `RiskEvent` objects:
+On Unix builds, connect to the UNIX socket to receive a **newline-delimited JSON stream** of `RiskEvent` objects:
 
 ```bash
 nc -U /tmp/dwell-agent/dwell-agent.sock
@@ -221,6 +243,8 @@ Send commands over the same socket (newline-delimited text):
 | `status` | Logs runtime counters (uptime, keystrokes, emitted risks, webhook stats) |
 | `reload-policy` | Re-reads `policy_file` from disk |
 
+Command results are written to the agent logs; the socket itself remains a stream of `RiskEvent` JSON lines.
+
 ### Webhook payload
 
 If `webhook_url` is configured, the agent sends `POST` requests with the exact `RiskEvent` JSON schema shown above.
@@ -245,13 +269,13 @@ Delivery behavior:
 
 ```bash
 # check with clippy
-cargo clippy -- -D warnings
+cargo clippy --all-targets --all-features -- -D warnings
 
 # format
-cargo fmt
+cargo fmt --all
 
 # run tests
-cargo test
+cargo test --all-targets --all-features
 
 # run with verbose logging
 DWELL_LOG_LEVEL=debug cargo run
@@ -267,9 +291,9 @@ DWELL_LOG_LEVEL=debug cargo run
 
 ## Testing
 
-The test suite lives alongside each module (`#[cfg(test)]`):
+The test suite includes both module-local unit tests and end-to-end integration coverage in `tests/integration.rs`.
 
-| Module | Tests |
+| Area | Coverage |
 |---|---|
 | `baseline` | EMA update, enrollment threshold, encrypt/decrypt round-trip |
 | `features` | Dwell/flight extraction, correction-rate logic, outlier filtering, `to_vec`, proptest no-panic |
@@ -277,11 +301,12 @@ The test suite lives alongside each module (`#[cfg(test)]`):
 | `policy` | Tier mapping, boundary checks, action parsing, reload from TOML |
 | `monitoring` | Atomic counter increments and snapshot sanity |
 | `config` | Default configuration sanity and serde round-trip |
+| `ipc` / integration | Command delivery, streamed `RiskEvent`s, runtime pipeline wiring |
 
 Run:
 
 ```bash
-cargo test
+cargo test --all-targets --all-features
 ```
 
 For coverage (requires `cargo-llvm-cov`):
@@ -305,7 +330,7 @@ Performance benchmark (Criterion):
 cargo bench --bench feature_extraction
 
 # CI smoke check (compile benches only)
-cargo bench --bench feature_extraction --no-run
+cargo bench --all-features --bench feature_extraction --no-run
 ```
 
 ---
@@ -314,7 +339,7 @@ cargo bench --bench feature_extraction --no-run
 
 1. Fork the repository.
 2. Create a feature branch: `git checkout -b feat/my-feature`.
-3. Ensure `cargo clippy -- -D warnings` and `cargo test` pass.
+3. Ensure `cargo fmt --all`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test --all-targets --all-features` pass.
 4. Open a pull request against `main`.
 
 ---

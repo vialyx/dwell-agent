@@ -1,4 +1,4 @@
-use dwell_agent::baseline::BaselineProfile;
+use dwell_agent::baseline::{BaselineError, BaselineProfile};
 use dwell_agent::capture::create_capture;
 use dwell_agent::config::load_config;
 use dwell_agent::events::{EventType, KeystrokeEvent};
@@ -14,11 +14,36 @@ use dwell_agent::webhook;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::{broadcast, mpsc};
 use tracing::{error, info, warn};
 use tracing_subscriber::fmt;
 use uuid::Uuid;
+
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() -> Result<(), Box<dyn std::error::Error>> {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let mut sigint = signal(SignalKind::interrupt())?;
+
+    tokio::select! {
+        _ = sigterm.recv() => {
+            info!("Received SIGTERM, shutting down");
+        }
+        _ = sigint.recv() => {
+            info!("Received SIGINT, shutting down");
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown_signal() -> Result<(), Box<dyn std::error::Error>> {
+    tokio::signal::ctrl_c().await?;
+    info!("Received Ctrl+C, shutting down");
+    Ok(())
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -53,9 +78,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
             p
         }
-        Err(_) => {
+        Err(BaselineError::Io(io_err)) if io_err.kind() == std::io::ErrorKind::NotFound => {
             info!("Creating new baseline profile");
             BaselineProfile::new(9, config.ema_alpha)
+        }
+        Err(e) => {
+            return Err(format!(
+                "failed to load profile at '{}': {}",
+                config.profile_path, e
+            )
+            .into());
         }
     };
     let profile = Arc::new(Mutex::new(profile));
@@ -162,14 +194,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // IPC server
-    let ipc_server = IpcServer::new(&config.ipc_socket, config.ipc_require_same_user)
-        .map_err(|e| format!("IPC initialization error: {e}"))?;
-    let ipc_task = tokio::spawn(async move {
-        if let Err(e) = ipc_server.run(risk_rx, cmd_tx).await {
-            error!("IPC server error: {}", e);
-        }
-    });
+    #[cfg(unix)]
+    let ipc_task = {
+        let ipc_server = IpcServer::new(&config.ipc_socket, config.ipc_require_same_user)
+            .map_err(|e| format!("IPC initialization error: {e}"))?;
+        Some(tokio::spawn(async move {
+            if let Err(e) = ipc_server.run(risk_rx, cmd_tx).await {
+                error!("IPC server error: {}", e);
+            }
+        }))
+    };
+
+    #[cfg(not(unix))]
+    let ipc_task: Option<tokio::task::JoinHandle<()>> = {
+        let _ = risk_rx;
+        let _ = cmd_tx;
+        warn!(
+            "IPC risk-event streaming is disabled on this platform (requires Unix domain sockets)"
+        );
+        None
+    };
 
     // Optional webhook dispatcher
     let webhook_task = config
@@ -252,18 +296,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // SIGTERM handler
-    let mut sigterm = signal(SignalKind::terminate())?;
-    let mut sigint = signal(SignalKind::interrupt())?;
-
-    tokio::select! {
-        _ = sigterm.recv() => {
-            info!("Received SIGTERM, shutting down");
-        }
-        _ = sigint.recv() => {
-            info!("Received SIGINT, shutting down");
-        }
-    }
+    wait_for_shutdown_signal().await?;
 
     // Graceful shutdown: flush profile
     capture.stop();
@@ -274,7 +307,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("Profile saved");
     }
 
-    ipc_task.abort();
+    if let Some(handle) = ipc_task {
+        handle.abort();
+    }
     policy_task.abort();
     cmd_task.abort();
     health_task.abort();

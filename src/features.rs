@@ -2,8 +2,25 @@ use crate::events::{EventType, KeystrokeEvent};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+#[cfg(target_os = "linux")]
 const BACKSPACE: u32 = 14; // Linux evdev key code for backspace
+#[cfg(target_os = "linux")]
 const DELETE: u32 = 111; // Linux evdev key code for delete
+
+#[cfg(target_os = "macos")]
+const BACKSPACE: u32 = 51; // macOS virtual key code: Delete (backspace)
+#[cfg(target_os = "macos")]
+const DELETE: u32 = 117; // macOS virtual key code: Forward Delete
+
+#[cfg(target_os = "windows")]
+const BACKSPACE: u32 = 0x08; // Win32 VK_BACK
+#[cfg(target_os = "windows")]
+const DELETE: u32 = 0x2E; // Win32 VK_DELETE
+
+#[inline]
+fn is_correction_key(key_code: u32) -> bool {
+    key_code == BACKSPACE || key_code == DELETE
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FeatureVector {
@@ -101,7 +118,7 @@ impl FeatureExtractor {
                     total_keys += 1;
 
                     // Check correction timing
-                    if event.key_code == BACKSPACE || event.key_code == DELETE {
+                    if is_correction_key(event.key_code) {
                         error_keys += 1;
                         // Check timing relative to last key down
                         if let Some((_, last_ts)) = last_key_down {

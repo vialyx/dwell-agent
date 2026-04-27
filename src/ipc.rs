@@ -1,17 +1,29 @@
+#[cfg(unix)]
 use std::path::Path;
+#[cfg(unix)]
 use std::sync::Arc;
+#[cfg(unix)]
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+#[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
+#[cfg(unix)]
 use tracing::{error, info, warn};
+#[cfg(not(unix))]
+use tracing::warn;
 
 use crate::risk::RiskEvent;
 
+#[cfg(unix)]
 pub struct IpcServer {
     socket_path: String,
     require_same_user: bool,
     owner_uid: u32,
 }
 
+#[cfg(not(unix))]
+pub struct IpcServer;
+
+#[cfg(unix)]
 impl IpcServer {
     pub fn new(socket_path: &str, require_same_user: bool) -> Result<Self, std::io::Error> {
         prepare_socket_parent(socket_path)?;
@@ -65,6 +77,23 @@ impl IpcServer {
     }
 }
 
+#[cfg(not(unix))]
+impl IpcServer {
+    pub fn new(_socket_path: &str, _require_same_user: bool) -> Result<Self, std::io::Error> {
+        Ok(Self)
+    }
+
+    pub async fn run(
+        &self,
+        _risk_rx: tokio::sync::broadcast::Receiver<RiskEvent>,
+        _cmd_tx: tokio::sync::mpsc::Sender<String>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        warn!("IPC server is not supported on this platform");
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
 async fn handle_client(
     stream: UnixStream,
     mut risk_rx: tokio::sync::broadcast::Receiver<RiskEvent>,
@@ -112,12 +141,14 @@ async fn handle_client(
     }
 }
 
+#[cfg(unix)]
 impl Drop for IpcServer {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.socket_path);
     }
 }
 
+#[cfg(unix)]
 fn prepare_socket_parent(socket_path: &str) -> Result<(), std::io::Error> {
     let path = Path::new(socket_path);
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
@@ -135,6 +166,7 @@ fn prepare_socket_parent(socket_path: &str) -> Result<(), std::io::Error> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn set_socket_permissions(socket_path: &str) -> Result<(), std::io::Error> {
     #[cfg(unix)]
     {
@@ -144,6 +176,7 @@ fn set_socket_permissions(socket_path: &str) -> Result<(), std::io::Error> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn is_authorized_peer(stream: &UnixStream, owner_uid: u32) -> bool {
     match stream.peer_cred() {
         Ok(creds) => creds.uid() == owner_uid,
@@ -151,7 +184,7 @@ fn is_authorized_peer(stream: &UnixStream, owner_uid: u32) -> bool {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::features::FeatureName;
