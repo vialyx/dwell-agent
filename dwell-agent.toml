@@ -6,11 +6,22 @@ risk_threshold = 5.0
 risk_k = 1.0
 policy_file = "policy.toml"
 profile_path = "profile.enc"
+profile_autosave_secs = 300
 log_level = "info"
 ipc_socket = "/tmp/dwell-agent/dwell-agent.sock"
+ipc_tcp_bind = "127.0.0.1:9465"
 ipc_require_same_user = true
+management_bind = "127.0.0.1:9464"
 allow_insecure_placeholder_key = false
 webhook_url = ""
+webhook_spool_dir = "webhook-spool"
 webhook_min_risk_score = 0
 webhook_timeout_secs = 5
 metrics_log_interval_secs = 60
+
+# Optional command hooks for policy actions. Each hook is argv-style.
+# [action_hooks]
+# emit_siem_tag = ["/usr/local/bin/siem-tag", "--source", "dwell-agent"]
+# trigger_re_verification = ["/usr/local/bin/reverify-session"]
+# trigger_step_up = ["/usr/local/bin/step-up-mfa"]
+# terminate_session = ["/usr/local/bin/terminate-session"]

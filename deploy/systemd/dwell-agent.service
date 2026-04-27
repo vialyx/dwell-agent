@@ -1,0 +1,27 @@
+[Unit]
+Description=Dwell Agent continuous authentication service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dwell-agent
+Group=input
+WorkingDirectory=/var/lib/dwell-agent
+EnvironmentFile=/etc/dwell-agent/dwell-agent.env
+ExecStart=/usr/local/bin/dwell-agent
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/dwell-agent
+RuntimeDirectory=dwell-agent
+RuntimeDirectoryMode=0700
+UMask=0077
+# Grant only the minimum device access required on Linux.
+SupplementaryGroups=input
+
+[Install]
+WantedBy=multi-user.target

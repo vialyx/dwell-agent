@@ -1,15 +1,23 @@
+#[cfg(not(unix))]
+use std::net::SocketAddr;
 #[cfg(unix)]
 use std::path::Path;
-#[cfg(unix)]
+#[cfg(not(unix))]
 use std::sync::Arc;
 #[cfg(unix)]
+use std::sync::Arc;
+#[cfg(not(unix))]
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 #[cfg(unix)]
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+#[cfg(not(unix))]
+use tokio::net::{TcpListener, TcpStream};
+#[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
+#[cfg(not(unix))]
+use tracing::{error, info, warn};
 #[cfg(unix)]
 use tracing::{error, info, warn};
-#[cfg(not(unix))]
-use tracing::warn;
 
 use crate::risk::RiskEvent;
 
@@ -21,7 +29,10 @@ pub struct IpcServer {
 }
 
 #[cfg(not(unix))]
-pub struct IpcServer;
+pub struct IpcServer {
+    bind_addr: String,
+    require_same_user: bool,
+}
 
 #[cfg(unix)]
 impl IpcServer {
@@ -79,17 +90,54 @@ impl IpcServer {
 
 #[cfg(not(unix))]
 impl IpcServer {
-    pub fn new(_socket_path: &str, _require_same_user: bool) -> Result<Self, std::io::Error> {
-        Ok(Self)
+    pub fn new(bind_addr: &str, require_same_user: bool) -> Result<Self, std::io::Error> {
+        let parsed: SocketAddr = bind_addr.parse().map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid IPC TCP bind address '{bind_addr}': {e}"),
+            )
+        })?;
+        if !parsed.ip().is_loopback() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "IPC TCP bind address must be loopback on non-Unix platforms",
+            ));
+        }
+
+        Ok(Self {
+            bind_addr: bind_addr.to_string(),
+            require_same_user,
+        })
     }
 
     pub async fn run(
         &self,
-        _risk_rx: tokio::sync::broadcast::Receiver<RiskEvent>,
-        _cmd_tx: tokio::sync::mpsc::Sender<String>,
+        risk_rx: tokio::sync::broadcast::Receiver<RiskEvent>,
+        cmd_tx: tokio::sync::mpsc::Sender<String>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        warn!("IPC server is not supported on this platform");
-        Ok(())
+        if self.require_same_user {
+            warn!(
+                "ipc_require_same_user is not enforceable on this platform; relying on loopback-only IPC TCP bind"
+            );
+        }
+
+        let listener = TcpListener::bind(&self.bind_addr).await?;
+        info!("IPC server listening on tcp://{}", self.bind_addr);
+
+        let cmd_tx = Arc::new(cmd_tx);
+
+        loop {
+            match listener.accept().await {
+                Ok((stream, _)) => {
+                    let risk_rx2 = risk_rx.resubscribe();
+                    let cmd_tx2 = cmd_tx.clone();
+                    tokio::spawn(handle_tcp_client(stream, risk_rx2, cmd_tx2));
+                }
+                Err(e) => {
+                    error!("IPC TCP accept error: {}", e);
+                }
+            }
+        }
     }
 }
 
@@ -114,6 +162,54 @@ async fn handle_client(
                     Ok(None) => break,
                     Err(e) => {
                         error!("IPC client read error: {}", e);
+                        break;
+                    }
+                }
+            }
+            recv_res = risk_rx.recv() => {
+                match recv_res {
+                    Ok(event) => {
+                        match serde_json::to_string(&event) {
+                            Ok(json) => {
+                                let line = format!("{}\n", json);
+                                if write_half.write_all(line.as_bytes()).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(e) => error!("Failed to serialize risk event: {}", e),
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn handle_tcp_client(
+    stream: TcpStream,
+    mut risk_rx: tokio::sync::broadcast::Receiver<RiskEvent>,
+    cmd_tx: Arc<tokio::sync::mpsc::Sender<String>>,
+) {
+    let (read_half, mut write_half) = stream.into_split();
+    let mut lines = BufReader::new(read_half).lines();
+
+    loop {
+        tokio::select! {
+            read_res = lines.next_line() => {
+                match read_res {
+                    Ok(Some(line)) => {
+                        if cmd_tx.send(line).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        error!("IPC TCP client read error: {}", e);
                         break;
                     }
                 }

@@ -1,11 +1,13 @@
-use dwell_agent::baseline::{BaselineError, BaselineProfile};
+use dwell_agent::actions::ActionExecutor;
+use dwell_agent::baseline::{BaselineProfile, ProfileLoadSource};
 use dwell_agent::capture::create_capture;
 use dwell_agent::config::load_config;
 use dwell_agent::events::{EventType, KeystrokeEvent};
 use dwell_agent::features::FeatureExtractor;
 use dwell_agent::ipc::IpcServer;
 use dwell_agent::keystore;
-use dwell_agent::monitoring::RuntimeStats;
+use dwell_agent::management;
+use dwell_agent::monitoring::{RuntimeStats, RuntimeStatsSnapshot};
 use dwell_agent::policy::PolicyEngine;
 use dwell_agent::risk;
 use dwell_agent::risk::RiskScorer;
@@ -45,11 +47,66 @@ async fn wait_for_shutdown_signal() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+async fn persist_profile_snapshot(
+    profile: Arc<Mutex<BaselineProfile>>,
+    profile_path: String,
+    profile_key: [u8; 32],
+    stats: Arc<RuntimeStats>,
+    reason: &'static str,
+) {
+    let snapshot = {
+        let guard = profile
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.clone()
+    };
+
+    match tokio::task::spawn_blocking(move || snapshot.save(&profile_path, &profile_key)).await {
+        Ok(Ok(())) => {
+            stats.inc_profile_saves();
+            info!(reason, "Profile saved");
+        }
+        Ok(Err(e)) => {
+            stats.inc_profile_save_failures();
+            error!(reason, error = %e, "Failed to save profile");
+        }
+        Err(e) => {
+            stats.inc_profile_save_failures();
+            error!(reason, error = %e, "Profile save task failed");
+        }
+    }
+}
+
+fn log_runtime_snapshot(message: &str, snapshot: &RuntimeStatsSnapshot) {
+    info!(
+        message,
+        uptime_secs = snapshot.uptime_secs,
+        keystrokes_seen = snapshot.keystrokes_seen,
+        risk_events_emitted = snapshot.risk_events_emitted,
+        policy_evaluations = snapshot.policy_evaluations,
+        commands_received = snapshot.commands_received,
+        webhook_deliveries = snapshot.webhook_deliveries,
+        webhook_failures = snapshot.webhook_failures,
+        webhook_events_queued = snapshot.webhook_events_queued,
+        webhook_queue_depth = snapshot.webhook_queue_depth,
+        action_successes = snapshot.action_successes,
+        action_failures = snapshot.action_failures,
+        action_skipped = snapshot.action_skipped,
+        profile_saves = snapshot.profile_saves,
+        profile_save_failures = snapshot.profile_save_failures,
+        profile_load_failures = snapshot.profile_load_failures,
+        profile_recoveries = snapshot.profile_recoveries,
+        capture_start_failures = snapshot.capture_start_failures,
+        policy_reload_successes = snapshot.policy_reload_successes,
+        policy_reload_failures = snapshot.policy_reload_failures,
+        management_requests = snapshot.management_requests,
+    );
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = load_config().map_err(|e| format!("configuration error: {e}"))?;
 
-    // Initialize tracing
     fmt()
         .json()
         .with_max_level(match config.log_level.as_str() {
@@ -69,56 +126,62 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!(?session_id, "Session started");
     let stats = Arc::new(RuntimeStats::new());
 
-    // Load or create baseline profile
-    let profile = match BaselineProfile::load(&config.profile_path, &profile_key) {
-        Ok(p) => {
+    let (profile, profile_report) = BaselineProfile::load_with_recovery(
+        &config.profile_path,
+        &profile_key,
+        9,
+        config.ema_alpha,
+    )?;
+    if profile_report.primary_failed {
+        stats.inc_profile_load_failures();
+        warn!(path = %config.profile_path, "Primary profile failed to load and was quarantined");
+    }
+    if profile_report.backup_failed {
+        stats.inc_profile_load_failures();
+        warn!(path = %config.profile_path, "Backup profile failed to load and was quarantined");
+    }
+    if profile_report.recovered_from_backup {
+        stats.inc_profile_recoveries();
+    }
+    match profile_report.source {
+        ProfileLoadSource::Primary => {
             info!(
-                "Loaded existing profile with {} enrollment keystrokes",
-                p.enrollment_count
+                enrollment_count = profile.enrollment_count,
+                "Loaded existing profile"
             );
-            p
         }
-        Err(BaselineError::Io(io_err)) if io_err.kind() == std::io::ErrorKind::NotFound => {
+        ProfileLoadSource::Backup => {
+            warn!(
+                enrollment_count = profile.enrollment_count,
+                "Recovered profile from backup"
+            );
+        }
+        ProfileLoadSource::Fresh => {
             info!("Creating new baseline profile");
-            BaselineProfile::new(9, config.ema_alpha)
         }
-        Err(e) => {
-            return Err(format!(
-                "failed to load profile at '{}': {}",
-                config.profile_path, e
-            )
-            .into());
-        }
-    };
+    }
     let profile = Arc::new(Mutex::new(profile));
 
-    // Channel for raw keystroke events
     let (keystroke_tx, keystroke_rx) = crossbeam_channel::unbounded::<KeystrokeEvent>();
-
-    // Channel for risk events (broadcast to IPC clients)
     let (risk_tx, risk_rx) = broadcast::channel::<risk::RiskEvent>(100);
-
-    // Management command channel
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<String>(32);
 
-    // Start capture
     let capture = create_capture();
     info!("Starting keystroke capture");
     if let Err(e) = capture.start(keystroke_tx.clone()).await {
+        stats.inc_capture_start_failures();
         warn!(
-            "Capture start failed: {} (this is expected in CI/non-interactive environments)",
-            e
+            error = %e,
+            "Capture start failed (expected in CI/non-interactive environments)"
         );
     }
 
-    // Feature extraction and risk scoring loop
     let profile_clone = profile.clone();
     let config_clone = config.clone();
     let risk_tx_clone = risk_tx.clone();
     let stats_clone = stats.clone();
     let window_size = config.window_size;
     let min_enrollment = config.min_enrollment_keystrokes;
-
     let risk_scorer = RiskScorer::new(config.risk_threshold, config.risk_k);
 
     let scoring_task = tokio::task::spawn_blocking(move || {
@@ -143,14 +206,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let events: Vec<KeystrokeEvent> = window.iter().cloned().collect();
                 let fv = FeatureExtractor::extract(&events);
                 let feature_vec = fv.to_vec();
-
-                // Count actual KeyDown events for correct enrollment accounting
                 let keystroke_count = events
                     .iter()
                     .filter(|e| e.event_type == EventType::KeyDown)
                     .count();
 
-                let mut p = profile_clone.lock().unwrap_or_else(|p| p.into_inner());
+                let mut p = profile_clone
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 p.update(&feature_vec, keystroke_count);
 
                 if p.is_enrolled(min_enrollment) {
@@ -170,13 +233,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // Policy engine
     let policy_engine =
         Arc::new(PolicyEngine::new(&config.policy_file).map_err(|e| format!("policy error: {e}"))?);
+    let action_executor = Arc::new(ActionExecutor::new(
+        config.action_hooks.clone(),
+        stats.clone(),
+    ));
 
-    // Policy evaluation task
     let policy_clone = policy_engine.clone();
     let policy_stats = stats.clone();
+    let action_executor_clone = action_executor.clone();
     let mut policy_risk_rx = risk_tx.subscribe();
     let policy_task = tokio::spawn(async move {
         loop {
@@ -184,7 +250,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(event) => {
                     policy_stats.inc_policy_evaluations();
                     let actions = policy_clone.evaluate(event.risk_score);
-                    info!(?actions, risk_score = event.risk_score, "Policy actions");
+                    info!(
+                        ?actions,
+                        risk_score = event.risk_score,
+                        "Policy actions selected"
+                    );
+                    action_executor_clone.execute_all(&actions, &event).await;
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     warn!("Policy receiver lagged by {} events", n);
@@ -206,16 +277,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     #[cfg(not(unix))]
-    let ipc_task: Option<tokio::task::JoinHandle<()>> = {
-        let _ = risk_rx;
-        let _ = cmd_tx;
-        warn!(
-            "IPC risk-event streaming is disabled on this platform (requires Unix domain sockets)"
-        );
-        None
+    let ipc_task = {
+        let ipc_server = IpcServer::new(&config.ipc_tcp_bind, config.ipc_require_same_user)
+            .map_err(|e| format!("IPC initialization error: {e}"))?;
+        Some(tokio::spawn(async move {
+            if let Err(e) = ipc_server.run(risk_rx, cmd_tx).await {
+                error!("IPC server error: {}", e);
+            }
+        }))
     };
 
-    // Optional webhook dispatcher
+    let management_bind = config.management_bind.clone();
+    let management_stats = stats.clone();
+    let management_task = tokio::spawn(async move {
+        if let Err(e) = management::run_management_server(management_bind, management_stats).await {
+            error!(error = %e, "Management server error");
+        }
+    });
+
     let webhook_task = config
         .webhook_url
         .as_ref()
@@ -232,6 +311,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let webhook_stats = stats.clone();
             let min_risk = config.webhook_min_risk_score;
             let timeout_secs = config.webhook_timeout_secs;
+            let spool_dir = Some(config.webhook_spool_dir.clone());
             tokio::spawn(async move {
                 webhook::run_webhook_dispatcher(
                     url,
@@ -239,12 +319,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     timeout_secs,
                     webhook_risk_rx,
                     webhook_stats,
+                    spool_dir,
                 )
                 .await;
             })
         });
 
-    // Periodic health/monitoring logs
     let health_stats = stats.clone();
     let metrics_log_interval_secs = config.metrics_log_interval_secs.max(1);
     let health_task = tokio::spawn(async move {
@@ -252,20 +332,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         loop {
             interval.tick().await;
             let snapshot = health_stats.snapshot();
-            info!(
-                uptime_secs = snapshot.uptime_secs,
-                keystrokes_seen = snapshot.keystrokes_seen,
-                risk_events_emitted = snapshot.risk_events_emitted,
-                policy_evaluations = snapshot.policy_evaluations,
-                commands_received = snapshot.commands_received,
-                webhook_deliveries = snapshot.webhook_deliveries,
-                webhook_failures = snapshot.webhook_failures,
-                "Runtime health"
-            );
+            log_runtime_snapshot("Runtime health", &snapshot);
         }
     });
 
-    // Command handler
+    let autosave_profile = profile.clone();
+    let autosave_path = config.profile_path.clone();
+    let autosave_key = profile_key;
+    let autosave_stats = stats.clone();
+    let autosave_interval_secs = config.profile_autosave_secs.max(1);
+    let autosave_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(autosave_interval_secs));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            persist_profile_snapshot(
+                autosave_profile.clone(),
+                autosave_path.clone(),
+                autosave_key,
+                autosave_stats.clone(),
+                "autosave",
+            )
+            .await;
+        }
+    });
+
     let profile_path = config.profile_path.clone();
     let policy_file_for_cmd = config.policy_file.clone();
     let policy_engine_for_cmd = policy_engine.clone();
@@ -276,20 +367,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             match cmd.trim() {
                 "status" => {
                     let snapshot = stats_for_cmd.snapshot();
-                    info!(
-                        uptime_secs = snapshot.uptime_secs,
-                        keystrokes_seen = snapshot.keystrokes_seen,
-                        risk_events_emitted = snapshot.risk_events_emitted,
-                        policy_evaluations = snapshot.policy_evaluations,
-                        commands_received = snapshot.commands_received,
-                        webhook_deliveries = snapshot.webhook_deliveries,
-                        webhook_failures = snapshot.webhook_failures,
-                        "Status: running"
-                    );
+                    log_runtime_snapshot("Status: running", &snapshot);
                 }
                 "reload-policy" => match policy_engine_for_cmd.reload(&policy_file_for_cmd) {
-                    Ok(()) => info!("Policy reloaded from {}", policy_file_for_cmd),
-                    Err(e) => warn!("Policy reload failed: {}", e),
+                    Ok(()) => {
+                        stats_for_cmd.inc_policy_reload_successes();
+                        info!("Policy reloaded from {}", policy_file_for_cmd);
+                    }
+                    Err(e) => {
+                        stats_for_cmd.inc_policy_reload_failures();
+                        warn!("Policy reload failed: {}", e);
+                    }
                 },
                 _ => warn!("Unknown command: {}", cmd),
             }
@@ -298,14 +386,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     wait_for_shutdown_signal().await?;
 
-    // Graceful shutdown: flush profile
     capture.stop();
-    let p = profile.lock().unwrap_or_else(|p| p.into_inner());
-    if let Err(e) = p.save(&profile_path, &profile_key) {
-        error!("Failed to save profile: {}", e);
-    } else {
-        info!("Profile saved");
-    }
+    persist_profile_snapshot(
+        profile.clone(),
+        profile_path,
+        profile_key,
+        stats.clone(),
+        "shutdown",
+    )
+    .await;
 
     if let Some(handle) = ipc_task {
         handle.abort();
@@ -313,6 +402,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     policy_task.abort();
     cmd_task.abort();
     health_task.abort();
+    autosave_task.abort();
+    management_task.abort();
     if let Some(handle) = webhook_task {
         handle.abort();
     }

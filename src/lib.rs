@@ -1,3 +1,4 @@
+pub mod actions;
 pub mod baseline;
 pub mod capture;
 pub mod config;
@@ -5,6 +6,7 @@ pub mod events;
 pub mod features;
 pub mod ipc;
 pub mod keystore;
+pub mod management;
 pub mod monitoring;
 pub mod policy;
 pub mod risk;

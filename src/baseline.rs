@@ -23,6 +23,21 @@ pub enum BaselineError {
     InvalidData,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileLoadSource {
+    Primary,
+    Backup,
+    Fresh,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileLoadReport {
+    pub source: ProfileLoadSource,
+    pub primary_failed: bool,
+    pub backup_failed: bool,
+    pub recovered_from_backup: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BaselineProfile {
     pub feature_means: Vec<f64>,
@@ -137,6 +152,9 @@ impl BaselineProfile {
 
         write_result?;
 
+        let backup_path = backup_path_for(path);
+        let _ = fs::copy(target, &backup_path);
+
         // Best effort: fsync parent directory so the rename is durable.
         if let Ok(dir) = fs::File::open(parent) {
             let _ = dir.sync_all();
@@ -148,11 +166,133 @@ impl BaselineProfile {
         let data = fs::read(path)?;
         Self::from_encrypted_bytes(&data, key)
     }
+
+    pub fn load_with_recovery(
+        path: &str,
+        key: &[u8; 32],
+        feature_dim: usize,
+        ema_alpha: f64,
+    ) -> Result<(Self, ProfileLoadReport), BaselineError> {
+        match Self::load(path, key) {
+            Ok(profile) => Ok((
+                profile,
+                ProfileLoadReport {
+                    source: ProfileLoadSource::Primary,
+                    primary_failed: false,
+                    backup_failed: false,
+                    recovered_from_backup: false,
+                },
+            )),
+            Err(BaselineError::Io(io_err)) if io_err.kind() == std::io::ErrorKind::NotFound => {
+                let backup_path = backup_path_for(path);
+                if backup_path.exists() {
+                    match Self::load(backup_path.to_string_lossy().as_ref(), key) {
+                        Ok(profile) => {
+                            let _ = profile.save(path, key);
+                            return Ok((
+                                profile,
+                                ProfileLoadReport {
+                                    source: ProfileLoadSource::Backup,
+                                    primary_failed: false,
+                                    backup_failed: false,
+                                    recovered_from_backup: true,
+                                },
+                            ));
+                        }
+                        Err(_) => {
+                            let _ = quarantine_file(&backup_path);
+                        }
+                    }
+                }
+
+                Ok((
+                    Self::new(feature_dim, ema_alpha),
+                    ProfileLoadReport {
+                        source: ProfileLoadSource::Fresh,
+                        primary_failed: false,
+                        backup_failed: false,
+                        recovered_from_backup: false,
+                    },
+                ))
+            }
+            Err(_) => {
+                let _ = quarantine_file(Path::new(path));
+                let backup_path = backup_path_for(path);
+                if backup_path.exists() {
+                    match Self::load(backup_path.to_string_lossy().as_ref(), key) {
+                        Ok(profile) => {
+                            let _ = profile.save(path, key);
+                            return Ok((
+                                profile,
+                                ProfileLoadReport {
+                                    source: ProfileLoadSource::Backup,
+                                    primary_failed: true,
+                                    backup_failed: false,
+                                    recovered_from_backup: true,
+                                },
+                            ));
+                        }
+                        Err(_) => {
+                            let _ = quarantine_file(&backup_path);
+                            return Ok((
+                                Self::new(feature_dim, ema_alpha),
+                                ProfileLoadReport {
+                                    source: ProfileLoadSource::Fresh,
+                                    primary_failed: true,
+                                    backup_failed: true,
+                                    recovered_from_backup: false,
+                                },
+                            ));
+                        }
+                    }
+                }
+
+                Ok((
+                    Self::new(feature_dim, ema_alpha),
+                    ProfileLoadReport {
+                        source: ProfileLoadSource::Fresh,
+                        primary_failed: true,
+                        backup_failed: false,
+                        recovered_from_backup: false,
+                    },
+                ))
+            }
+        }
+    }
+}
+
+fn backup_path_for(path: &str) -> PathBuf {
+    PathBuf::from(format!("{path}.bak"))
+}
+
+fn quarantine_file(path: &Path) -> Result<(), std::io::Error> {
+    if !path.exists() {
+        return Ok(());
+    }
+
+    let quarantine_name = format!(
+        "{}.quarantine-{}",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("profile"),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let quarantine_path = path.with_file_name(quarantine_name);
+    fs::rename(path, quarantine_path)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use uuid::Uuid;
+
+    fn unique_path(label: &str) -> String {
+        let id = &Uuid::new_v4().as_simple().to_string()[..10];
+        format!("/tmp/dw-{label}-{id}.enc")
+    }
 
     #[test]
     fn test_update_changes_means() {
@@ -222,5 +362,42 @@ mod tests {
             BaselineProfile::from_encrypted_bytes(&encrypted, &key_b),
             Err(BaselineError::Decryption)
         ));
+    }
+
+    #[test]
+    fn test_save_creates_backup_copy() {
+        let key = [7u8; 32];
+        let path = unique_path("backup");
+        let backup = backup_path_for(&path);
+        let profile = BaselineProfile::new(3, 0.05);
+
+        profile.save(&path, &key).unwrap();
+        assert!(Path::new(&path).exists());
+        assert!(backup.exists());
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(backup);
+    }
+
+    #[test]
+    fn test_load_with_recovery_uses_backup_when_primary_is_corrupt() {
+        let key = [9u8; 32];
+        let path = unique_path("recovery");
+        let backup = backup_path_for(&path);
+        let mut profile = BaselineProfile::new(3, 0.05);
+        profile.update(&[1.0, 2.0, 3.0], 10);
+        profile.save(&path, &key).unwrap();
+        assert!(backup.exists());
+
+        fs::write(&path, b"corrupt").unwrap();
+        let (loaded, report) = BaselineProfile::load_with_recovery(&path, &key, 3, 0.05).unwrap();
+
+        assert_eq!(report.source, ProfileLoadSource::Backup);
+        assert!(report.primary_failed);
+        assert!(report.recovered_from_backup);
+        assert_eq!(loaded.enrollment_count, 10);
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(backup);
     }
 }

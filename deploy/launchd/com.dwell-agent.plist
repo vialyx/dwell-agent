@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.dwell-agent</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/dwell-agent</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/usr/local/var/dwell-agent</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/usr/local/var/log/dwell-agent.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/usr/local/var/log/dwell-agent.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>DWELL_PROFILE_KEY</key>
+        <string>REPLACE_WITH_SECRET_OR_INJECT_VIA_WRAPPER</string>
+    </dict>
+</dict>
+</plist>
