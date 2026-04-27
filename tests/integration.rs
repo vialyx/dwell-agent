@@ -275,7 +275,7 @@ fn test_runtime_stats_pipeline_simulation() {
 fn test_ipc_server_removes_stale_socket_on_init() {
     let path = unique_sock("stale");
     std::fs::write(&path, b"stale-data").unwrap();
-    let _server = IpcServer::new(&path);
+    let _server = IpcServer::new(&path, true).expect("create IPC server");
     assert!(
         !Path::new(&path).exists(),
         "stale socket not removed on IpcServer::new"
@@ -286,7 +286,7 @@ fn test_ipc_server_removes_stale_socket_on_init() {
 #[tokio::test]
 async fn test_ipc_command_and_risk_event_round_trip() {
     let socket_path = unique_sock("rt");
-    let server = IpcServer::new(&socket_path);
+    let server = IpcServer::new(&socket_path, true).expect("create IPC server");
 
     let (risk_tx, risk_rx) = broadcast::channel::<RiskEvent>(16);
     let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel::<String>(8);
@@ -347,7 +347,7 @@ async fn test_ipc_command_and_risk_event_round_trip() {
 #[tokio::test]
 async fn test_ipc_multiple_clients_receive_events() {
     let socket_path = unique_sock("multi");
-    let server = IpcServer::new(&socket_path);
+    let server = IpcServer::new(&socket_path, true).expect("create IPC server");
 
     let (risk_tx, risk_rx) = broadcast::channel::<RiskEvent>(16);
     let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::channel::<String>(8);

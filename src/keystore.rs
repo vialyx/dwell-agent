@@ -3,10 +3,12 @@
 //! Priority order for the 32-byte AES-256-GCM profile key:
 //!
 //! 1. `DWELL_PROFILE_KEY` environment variable — exactly 64 lowercase or uppercase hex characters.
-//! 2. Hard-coded placeholder `[0x42; 32]` (CI / development only) — emits a `warn!`.
+//! 2. Optional hard-coded placeholder `[0x42; 32]` (CI / development only) when
+//!    `allow_insecure_placeholder_key=true` in config — emits a `warn!`.
 //!
 //! # Production deployment
-//! Set `DWELL_PROFILE_KEY` to a secret managed by your secret store (Vault, AWS Secrets Manager,
+//! `DWELL_PROFILE_KEY` is required in production and should come from a secret store (Vault,
+//! AWS Secrets Manager,
 //! macOS Keychain via `security find-generic-password`, etc.) and export it to the agent's
 //! environment before launch:
 //!
@@ -15,6 +17,7 @@
 //! ./dwell-agent
 //! ```
 
+use thiserror::Error;
 use tracing::warn;
 
 const KEY_ENV_VAR: &str = "DWELL_PROFILE_KEY";
@@ -22,28 +25,36 @@ const KEY_ENV_VAR: &str = "DWELL_PROFILE_KEY";
 /// The CI/dev placeholder key.  Never use in production.
 pub const PLACEHOLDER_KEY: [u8; 32] = [0x42u8; 32];
 
-/// Derive the 32-byte profile key, with a loud warning if falling back to the placeholder.
-pub fn derive_profile_key() -> [u8; 32] {
+#[derive(Debug, Error)]
+pub enum KeystoreError {
+    #[error("Missing required environment variable {0}")]
+    MissingKey(&'static str),
+    #[error("Invalid {var}: {reason}")]
+    InvalidKey { var: &'static str, reason: String },
+}
+
+/// Derive the 32-byte profile key.
+///
+/// By default this function is fail-closed and requires `DWELL_PROFILE_KEY`.
+/// `allow_insecure_placeholder_key` is intended only for CI/local development.
+pub fn derive_profile_key(allow_insecure_placeholder_key: bool) -> Result<[u8; 32], KeystoreError> {
     if let Ok(hex_key) = std::env::var(KEY_ENV_VAR) {
-        match parse_hex_key(&hex_key) {
-            Ok(key) => return key,
-            Err(e) => {
-                warn!(
-                    var = KEY_ENV_VAR,
-                    error = %e,
-                    "Invalid DWELL_PROFILE_KEY — falling back to placeholder key \
-                     (NOT SAFE FOR PRODUCTION)"
-                );
-            }
-        }
+        return parse_hex_key(&hex_key).map_err(|reason| KeystoreError::InvalidKey {
+            var: KEY_ENV_VAR,
+            reason,
+        });
     }
 
-    warn!(
-        "No {} set — using placeholder key [0x42; 32]. \
-         Set {}=<64 hex chars> before deploying to production.",
-        KEY_ENV_VAR, KEY_ENV_VAR,
-    );
-    PLACEHOLDER_KEY
+    if allow_insecure_placeholder_key {
+        warn!(
+            "{} is not set; using insecure placeholder key [0x42; 32]. \
+             This must not be used in production.",
+            KEY_ENV_VAR,
+        );
+        return Ok(PLACEHOLDER_KEY);
+    }
+
+    Err(KeystoreError::MissingKey(KEY_ENV_VAR))
 }
 
 /// Parse a 64-character hex string into a 32-byte array.

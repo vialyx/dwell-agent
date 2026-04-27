@@ -5,6 +5,8 @@ use aes_gcm::{
 };
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -99,7 +101,46 @@ impl BaselineProfile {
 
     pub fn save(&self, path: &str, key: &[u8; 32]) -> Result<(), BaselineError> {
         let bytes = self.to_encrypted_bytes(key)?;
-        fs::write(path, bytes)?;
+        let target = Path::new(path);
+        let parent = target.parent().unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent)?;
+
+        let file_name = target
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("profile.enc");
+        let tmp_name = format!(
+            ".{}.tmp-{}-{}",
+            file_name,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let tmp_path: PathBuf = parent.join(tmp_name);
+
+        let write_result = (|| -> Result<(), BaselineError> {
+            let mut file = fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&tmp_path)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            fs::rename(&tmp_path, target)?;
+            Ok(())
+        })();
+
+        if write_result.is_err() {
+            let _ = fs::remove_file(&tmp_path);
+        }
+
+        write_result?;
+
+        // Best effort: fsync parent directory so the rename is durable.
+        if let Ok(dir) = fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
         Ok(())
     }
 

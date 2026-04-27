@@ -13,6 +13,8 @@ pub enum PolicyError {
     Parse(#[from] toml::de::Error),
     #[error("Watcher error: {0}")]
     Watcher(#[from] notify::Error),
+    #[error("Validation error: {0}")]
+    Validation(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,6 +52,14 @@ pub struct PolicyConfig {
     pub actions: ActionsConfig,
 }
 
+#[derive(Debug, Clone)]
+struct CompiledPolicy {
+    tiers: TierConfig,
+    low: Vec<PolicyAction>,
+    med: Vec<PolicyAction>,
+    high: Vec<PolicyAction>,
+}
+
 impl Default for PolicyConfig {
     fn default() -> Self {
         Self {
@@ -75,25 +85,61 @@ impl Default for PolicyConfig {
     }
 }
 
-fn parse_action(s: &str) -> Option<PolicyAction> {
+fn parse_action(s: &str) -> Result<PolicyAction, PolicyError> {
     match s {
-        "log" => Some(PolicyAction::Log),
-        "emit_siem_tag" => Some(PolicyAction::EmitSiemTag),
-        "trigger_re_verification" => Some(PolicyAction::TriggerReVerification),
-        "trigger_step_up" => Some(PolicyAction::TriggerStepUp),
-        "terminate_session" => Some(PolicyAction::TerminateSession),
-        _ => None,
+        "log" => Ok(PolicyAction::Log),
+        "emit_siem_tag" => Ok(PolicyAction::EmitSiemTag),
+        "trigger_re_verification" => Ok(PolicyAction::TriggerReVerification),
+        "trigger_step_up" => Ok(PolicyAction::TriggerStepUp),
+        "terminate_session" => Ok(PolicyAction::TerminateSession),
+        _ => Err(PolicyError::Validation(format!(
+            "unknown action '{s}' in policy",
+        ))),
     }
 }
 
+fn compile_policy(config: PolicyConfig) -> Result<CompiledPolicy, PolicyError> {
+    if config.tiers.low_max > config.tiers.med_max {
+        return Err(PolicyError::Validation(
+            "tiers.low_max must be <= tiers.med_max".to_string(),
+        ));
+    }
+
+    let low = config
+        .actions
+        .low
+        .iter()
+        .map(|s| parse_action(s))
+        .collect::<Result<Vec<_>, _>>()?;
+    let med = config
+        .actions
+        .med
+        .iter()
+        .map(|s| parse_action(s))
+        .collect::<Result<Vec<_>, _>>()?;
+    let high = config
+        .actions
+        .high
+        .iter()
+        .map(|s| parse_action(s))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(CompiledPolicy {
+        tiers: config.tiers,
+        low,
+        med,
+        high,
+    })
+}
+
 pub struct PolicyEngine {
-    config: Arc<RwLock<PolicyConfig>>,
+    config: Arc<RwLock<CompiledPolicy>>,
     _watcher: Option<RecommendedWatcher>,
 }
 
 impl PolicyEngine {
     pub fn new(policy_file: &str) -> Result<Self, PolicyError> {
-        let config = load_policy_config(policy_file).unwrap_or_default();
+        let config = compile_policy(load_policy_config(policy_file)?)?;
         let config = Arc::new(RwLock::new(config));
         let config_clone = config.clone();
         let policy_file_owned = policy_file.to_string();
@@ -103,12 +149,17 @@ impl PolicyEngine {
                 Ok(event) => {
                     if event.kind.is_modify() || event.kind.is_create() {
                         match load_policy_config(&policy_file_owned) {
-                            Ok(new_config) => {
-                                if let Ok(mut w) = config_clone.write() {
-                                    *w = new_config;
-                                    info!("Policy reloaded from {}", policy_file_owned);
+                            Ok(new_config) => match compile_policy(new_config) {
+                                Ok(compiled) => {
+                                    if let Ok(mut w) = config_clone.write() {
+                                        *w = compiled;
+                                        info!("Policy reloaded from {}", policy_file_owned);
+                                    }
                                 }
-                            }
+                                Err(e) => {
+                                    error!("Failed to validate reloaded policy: {}", e);
+                                }
+                            },
                             Err(e) => {
                                 error!("Failed to reload policy: {}", e);
                             }
@@ -130,7 +181,9 @@ impl PolicyEngine {
 
     pub fn new_default() -> Self {
         Self {
-            config: Arc::new(RwLock::new(PolicyConfig::default())),
+            config: Arc::new(RwLock::new(
+                compile_policy(PolicyConfig::default()).expect("default policy must compile"),
+            )),
             _watcher: None,
         }
     }
@@ -146,20 +199,15 @@ impl PolicyEngine {
             RiskTier::High
         };
 
-        let action_strings = match tier {
-            RiskTier::Low => &config.actions.low,
-            RiskTier::Medium => &config.actions.med,
-            RiskTier::High => &config.actions.high,
-        };
-
-        action_strings
-            .iter()
-            .filter_map(|s| parse_action(s))
-            .collect()
+        match tier {
+            RiskTier::Low => config.low.clone(),
+            RiskTier::Medium => config.med.clone(),
+            RiskTier::High => config.high.clone(),
+        }
     }
 
     pub fn reload(&self, policy_file: &str) -> Result<(), PolicyError> {
-        let new_config = load_policy_config(policy_file)?;
+        let new_config = compile_policy(load_policy_config(policy_file)?)?;
         let mut w = self.config.write().unwrap_or_else(|p| p.into_inner());
         *w = new_config;
         Ok(())
@@ -179,7 +227,9 @@ mod tests {
 
     fn default_engine() -> PolicyEngine {
         PolicyEngine {
-            config: Arc::new(RwLock::new(PolicyConfig::default())),
+            config: Arc::new(RwLock::new(
+                compile_policy(PolicyConfig::default()).unwrap(),
+            )),
             _watcher: None,
         }
     }
@@ -233,8 +283,24 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_action_unknown_returns_none() {
-        assert_eq!(parse_action("unknown_action"), None);
+    fn test_parse_action_unknown_returns_error() {
+        assert!(parse_action("unknown_action").is_err());
+    }
+
+    #[test]
+    fn test_compile_policy_invalid_tier_order() {
+        let cfg = PolicyConfig {
+            tiers: TierConfig {
+                low_max: 80,
+                med_max: 70,
+            },
+            actions: ActionsConfig {
+                low: vec!["log".to_string()],
+                med: vec!["log".to_string()],
+                high: vec!["log".to_string()],
+            },
+        };
+        assert!(compile_policy(cfg).is_err());
     }
 
     #[test]

@@ -1,23 +1,31 @@
 use std::path::Path;
+use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::risk::RiskEvent;
 
 pub struct IpcServer {
     socket_path: String,
+    require_same_user: bool,
+    owner_uid: u32,
 }
 
 impl IpcServer {
-    pub fn new(socket_path: &str) -> Self {
+    pub fn new(socket_path: &str, require_same_user: bool) -> Result<Self, std::io::Error> {
+        prepare_socket_parent(socket_path)?;
+
         // Remove stale socket if exists
         if Path::new(socket_path).exists() {
-            let _ = std::fs::remove_file(socket_path);
+            std::fs::remove_file(socket_path)?;
         }
-        Self {
+
+        Ok(Self {
             socket_path: socket_path.to_string(),
-        }
+            require_same_user,
+            owner_uid: unsafe { libc::geteuid() as u32 },
+        })
     }
 
     pub async fn run(
@@ -26,13 +34,23 @@ impl IpcServer {
         cmd_tx: tokio::sync::mpsc::Sender<String>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let listener = UnixListener::bind(&self.socket_path)?;
+        set_socket_permissions(&self.socket_path)?;
         info!("IPC server listening on {}", self.socket_path);
+
+        let owner_uid = self.owner_uid;
+        let require_same_user = self.require_same_user;
+        let cmd_tx = Arc::new(cmd_tx);
 
         loop {
             tokio::select! {
                 accept_result = listener.accept() => {
                     match accept_result {
                         Ok((stream, _addr)) => {
+                            if require_same_user && !is_authorized_peer(&stream, owner_uid) {
+                                warn!("Rejected IPC client with different uid");
+                                continue;
+                            }
+
                             let risk_rx2 = risk_rx.resubscribe();
                             let cmd_tx2 = cmd_tx.clone();
                             tokio::spawn(handle_client(stream, risk_rx2, cmd_tx2));
@@ -50,7 +68,7 @@ impl IpcServer {
 async fn handle_client(
     stream: UnixStream,
     mut risk_rx: tokio::sync::broadcast::Receiver<RiskEvent>,
-    cmd_tx: tokio::sync::mpsc::Sender<String>,
+    cmd_tx: Arc<tokio::sync::mpsc::Sender<String>>,
 ) {
     let (read_half, mut write_half) = stream.into_split();
     let mut lines = BufReader::new(read_half).lines();
@@ -100,6 +118,39 @@ impl Drop for IpcServer {
     }
 }
 
+fn prepare_socket_parent(socket_path: &str) -> Result<(), std::io::Error> {
+    let path = Path::new(socket_path);
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let existed = parent.exists();
+    std::fs::create_dir_all(parent)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if !existed {
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+        }
+    }
+
+    Ok(())
+}
+
+fn set_socket_permissions(socket_path: &str) -> Result<(), std::io::Error> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+fn is_authorized_peer(stream: &UnixStream, owner_uid: u32) -> bool {
+    match stream.peer_cred() {
+        Ok(creds) => creds.uid() == owner_uid,
+        Err(_) => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,14 +181,14 @@ mod tests {
     fn test_new_removes_stale_socket_file() {
         let path = unique_socket_path();
         std::fs::write(&path, b"stale").expect("create stale socket file");
-        let _server = IpcServer::new(&path);
+        let _server = IpcServer::new(&path, true).expect("init IPC server");
         assert!(!Path::new(&path).exists());
     }
 
     #[tokio::test]
     async fn test_ipc_forwards_commands_and_streams_risk_events() {
         let path = unique_socket_path();
-        let server = IpcServer::new(&path);
+        let server = IpcServer::new(&path, true).expect("init IPC server");
 
         let (risk_tx, risk_rx) = tokio::sync::broadcast::channel::<RiskEvent>(16);
         let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel::<String>(8);

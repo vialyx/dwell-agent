@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -9,13 +9,15 @@ use uuid::Uuid;
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::Input::{
     GetRawInputData, RegisterRawInputDevices, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER,
     RIDEV_INPUTSINK, RID_INPUT, RIM_TYPEKEYBOARD,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, PostQuitMessage,
-    RegisterClassW, CS_HREDRAW, CS_VREDRAW, HWND_MESSAGE, MSG, WM_DESTROY, WM_INPUT, WNDCLASSW,
+    PostThreadMessageW, RegisterClassW, CS_HREDRAW, CS_VREDRAW, HWND_MESSAGE, MSG, WM_DESTROY,
+    WM_INPUT, WM_QUIT, WNDCLASSW,
 };
 
 use crate::capture::{CaptureError, KeystrokeCapture};
@@ -29,12 +31,14 @@ thread_local! {
 
 pub struct WindowsCapture {
     running: Arc<AtomicBool>,
+    capture_thread_id: Arc<AtomicU32>,
 }
 
 impl WindowsCapture {
     pub fn new() -> Self {
         Self {
             running: Arc::new(AtomicBool::new(false)),
+            capture_thread_id: Arc::new(AtomicU32::new(0)),
         }
     }
 }
@@ -124,6 +128,7 @@ impl KeystrokeCapture for WindowsCapture {
         self.running.store(true, Ordering::SeqCst);
 
         let running = self.running.clone();
+        let capture_thread_id = self.capture_thread_id.clone();
         let session_id = Uuid::new_v4();
 
         std::thread::spawn(move || {
@@ -132,6 +137,9 @@ impl KeystrokeCapture for WindowsCapture {
             SESSION_ID.with(|cell| *cell.borrow_mut() = session_id);
 
             unsafe {
+                let tid = GetCurrentThreadId();
+                capture_thread_id.store(tid, Ordering::SeqCst);
+
                 let hinstance = GetModuleHandleW(std::ptr::null());
 
                 // Register a window class for our message-only window.
@@ -207,6 +215,7 @@ impl KeystrokeCapture for WindowsCapture {
                 }
 
                 info!("Windows Raw Input message loop exited");
+                capture_thread_id.store(0, Ordering::SeqCst);
             }
         });
 
@@ -215,9 +224,11 @@ impl KeystrokeCapture for WindowsCapture {
 
     fn stop(&self) {
         self.running.store(false, Ordering::SeqCst);
-        // The message loop will notice the flag on its next iteration.
-        // For an immediate wakeup, PostThreadMessage(WM_QUIT) could be used,
-        // but the loop checks the flag before each blocking GetMessageW call,
-        // so the next keystroke event (or any posted message) will unblock it.
+        let tid = self.capture_thread_id.load(Ordering::SeqCst);
+        if tid != 0 {
+            unsafe {
+                let _ = PostThreadMessageW(tid, WM_QUIT, 0, 0);
+            }
+        }
     }
 }

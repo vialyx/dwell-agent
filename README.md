@@ -1,6 +1,6 @@
 # dwell-agent
 
-[![CI](https://github.com/your_actual_org/dwell-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/your_actual_org/dwell-agent/actions/workflows/ci.yml)
+CI: see [.github/workflows/ci.yml](.github/workflows/ci.yml)
 
 A production-grade **keystroke-dynamics continuous authentication agent** that builds a behavioural baseline of each user's typing rhythm and emits a real-time risk score.  
 The score can drive policy actions (SIEM tagging, step-up MFA, session termination) without ever logging the keys themselves.
@@ -115,6 +115,9 @@ cp policy.toml.example policy.toml             # optional
 ./target/release/dwell-agent
 ```
 
+For local smoke tests only, either set `DWELL_PROFILE_KEY` (64 hex chars) or set
+`allow_insecure_placeholder_key = true` in `dwell-agent.toml`.
+
 The agent writes structured JSON logs to stdout:
 
 ```json
@@ -142,7 +145,9 @@ Configuration is loaded in order (later sources override earlier):
 | `policy_file` | `policy.toml` | Path to the policy configuration |
 | `profile_path` | `profile.enc` | Path to the encrypted baseline profile |
 | `log_level` | `info` | Logging verbosity: `debug`, `info`, `warn`, `error` |
-| `ipc_socket` | `/tmp/dwell-agent.sock` | UNIX domain socket path |
+| `ipc_socket` | `/tmp/dwell-agent/dwell-agent.sock` | UNIX domain socket path |
+| `ipc_require_same_user` | `true` | Reject IPC clients with a different OS user ID |
+| `allow_insecure_placeholder_key` | `false` | Allow `[0x42;32]` profile key only for CI/dev (never production) |
 | `webhook_url` | _(none)_ | Optional HTTP endpoint that receives each `RiskEvent` as JSON |
 | `webhook_min_risk_score` | `0` | Only send webhook events at/above this risk score |
 | `webhook_timeout_secs` | `5` | HTTP timeout for webhook delivery attempts |
@@ -190,7 +195,7 @@ high = ["log", "emit_siem_tag", "trigger_step_up", "terminate_session"]
 Connect to the UNIX socket to receive a **newline-delimited JSON stream** of `RiskEvent` objects:
 
 ```bash
-nc -U /tmp/dwell-agent.sock
+nc -U /tmp/dwell-agent/dwell-agent.sock
 ```
 
 ### RiskEvent schema
@@ -229,8 +234,8 @@ Delivery behavior:
 
 ## Security notes
 
-- **Key management**: the default key (`0x42` × 32) is a placeholder for CI.  
-  In production, derive the profile key from the OS keychain (e.g. macOS Keychain, Linux kernel keyring, or a TPM-backed secret). Ensure that the key is stored securely and not hard-coded in the source code.
+- **Key management**: production is fail-closed. `DWELL_PROFILE_KEY` is required by default.  
+  The placeholder key (`0x42` × 32) is only available if `allow_insecure_placeholder_key=true`.
 - **Privilege separation**: run as a dedicated low-privilege user; grant only `/dev/input` group membership on Linux.
 - **Profile integrity**: AES-256-GCM provides both confidentiality and authentication. A corrupted or tampered profile will fail to load and be replaced by a fresh one.
 

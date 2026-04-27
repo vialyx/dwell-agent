@@ -22,7 +22,7 @@ use uuid::Uuid;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let config = load_config();
+    let config = load_config().map_err(|e| format!("configuration error: {e}"))?;
 
     // Initialize tracing
     fmt()
@@ -37,7 +37,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Starting dwell-agent");
 
-    let profile_key = keystore::derive_profile_key();
+    let profile_key = keystore::derive_profile_key(config.allow_insecure_placeholder_key)
+        .map_err(|e| format!("profile key error: {e}"))?;
 
     let session_id = Uuid::new_v4();
     info!(?session_id, "Session started");
@@ -138,13 +139,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // Policy engine
-    let policy_engine = match PolicyEngine::new(&config.policy_file) {
-        Ok(engine) => Arc::new(engine),
-        Err(e) => {
-            warn!("Policy engine init failed: {} - using defaults", e);
-            Arc::new(PolicyEngine::new_default())
-        }
-    };
+    let policy_engine =
+        Arc::new(PolicyEngine::new(&config.policy_file).map_err(|e| format!("policy error: {e}"))?);
 
     // Policy evaluation task
     let policy_clone = policy_engine.clone();
@@ -167,7 +163,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // IPC server
-    let ipc_server = IpcServer::new(&config.ipc_socket);
+    let ipc_server = IpcServer::new(&config.ipc_socket, config.ipc_require_same_user)
+        .map_err(|e| format!("IPC initialization error: {e}"))?;
     let ipc_task = tokio::spawn(async move {
         if let Err(e) = ipc_server.run(risk_rx, cmd_tx).await {
             error!("IPC server error: {}", e);

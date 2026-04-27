@@ -4,6 +4,18 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+const FEATURE_NAMES: [FeatureName; 9] = [
+    FeatureName::MeanDwellTime,
+    FeatureName::StdDwellTime,
+    FeatureName::MeanFlightTime,
+    FeatureName::StdFlightTime,
+    FeatureName::Wpm,
+    FeatureName::SpeedVariance,
+    FeatureName::ErrorRate,
+    FeatureName::ImmediateCorrectionRate,
+    FeatureName::DeliberateCorrectionRate,
+];
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RiskEvent {
     pub session_id: Uuid,
@@ -75,7 +87,6 @@ fn sigmoid(x: f64) -> f64 {
 }
 
 fn find_anomalous_features(features: &[f64], baseline: &BaselineProfile) -> Vec<FeatureName> {
-    let names = FeatureName::all();
     let mut anomalous = Vec::new();
     for (i, ((&x, &mu), &sigma)) in features
         .iter()
@@ -86,28 +97,12 @@ fn find_anomalous_features(features: &[f64], baseline: &BaselineProfile) -> Vec<
         let s = sigma.max(1e-9);
         let z = ((x - mu) / s).abs();
         if z > 2.0 {
-            if let Some(name) = names.get(i) {
+            if let Some(name) = FEATURE_NAMES.get(i) {
                 anomalous.push(name.clone());
             }
         }
     }
     anomalous
-}
-
-impl FeatureName {
-    pub fn all() -> Vec<FeatureName> {
-        vec![
-            FeatureName::MeanDwellTime,
-            FeatureName::StdDwellTime,
-            FeatureName::MeanFlightTime,
-            FeatureName::StdFlightTime,
-            FeatureName::Wpm,
-            FeatureName::SpeedVariance,
-            FeatureName::ErrorRate,
-            FeatureName::ImmediateCorrectionRate,
-            FeatureName::DeliberateCorrectionRate,
-        ]
-    }
 }
 
 #[cfg(test)]

@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AgentConfig {
@@ -12,6 +13,8 @@ pub struct AgentConfig {
     pub profile_path: String,
     pub log_level: String,
     pub ipc_socket: String,
+    pub ipc_require_same_user: bool,
+    pub allow_insecure_placeholder_key: bool,
     pub webhook_url: Option<String>,
     pub webhook_min_risk_score: u8,
     pub webhook_timeout_secs: u64,
@@ -30,7 +33,9 @@ impl Default for AgentConfig {
             policy_file: "policy.toml".to_string(),
             profile_path: "profile.enc".to_string(),
             log_level: "info".to_string(),
-            ipc_socket: "/tmp/dwell-agent.sock".to_string(),
+            ipc_socket: "/tmp/dwell-agent/dwell-agent.sock".to_string(),
+            ipc_require_same_user: true,
+            allow_insecure_placeholder_key: false,
             webhook_url: None,
             webhook_min_risk_score: 0,
             webhook_timeout_secs: 5,
@@ -39,16 +44,70 @@ impl Default for AgentConfig {
     }
 }
 
-pub fn load_config() -> AgentConfig {
+#[derive(Debug, Error)]
+pub enum ConfigError {
+    #[error("Failed to load configuration: {0}")]
+    Load(Box<figment::Error>),
+    #[error("Invalid configuration: {0}")]
+    Validation(String),
+}
+
+impl AgentConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.window_size == 0 {
+            return Err(ConfigError::Validation(
+                "window_size must be > 0".to_string(),
+            ));
+        }
+        if self.emit_interval_secs == 0 {
+            return Err(ConfigError::Validation(
+                "emit_interval_secs must be > 0".to_string(),
+            ));
+        }
+        if self.min_enrollment_keystrokes < self.window_size {
+            return Err(ConfigError::Validation(
+                "min_enrollment_keystrokes must be >= window_size".to_string(),
+            ));
+        }
+        if !(0.0..=1.0).contains(&self.ema_alpha) || self.ema_alpha == 0.0 {
+            return Err(ConfigError::Validation(
+                "ema_alpha must be in (0, 1]".to_string(),
+            ));
+        }
+        if self.risk_k <= 0.0 {
+            return Err(ConfigError::Validation("risk_k must be > 0".to_string()));
+        }
+        if self.webhook_timeout_secs == 0 {
+            return Err(ConfigError::Validation(
+                "webhook_timeout_secs must be > 0".to_string(),
+            ));
+        }
+        if self.metrics_log_interval_secs == 0 {
+            return Err(ConfigError::Validation(
+                "metrics_log_interval_secs must be > 0".to_string(),
+            ));
+        }
+        if self.ipc_socket.trim().is_empty() {
+            return Err(ConfigError::Validation(
+                "ipc_socket must not be empty".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub fn load_config() -> Result<AgentConfig, ConfigError> {
     use figment::{
         providers::{Env, Format, Serialized, Toml},
         Figment,
     };
-    Figment::from(Serialized::defaults(AgentConfig::default()))
+    let cfg: AgentConfig = Figment::from(Serialized::defaults(AgentConfig::default()))
         .merge(Toml::file("dwell-agent.toml"))
         .merge(Env::prefixed("DWELL_"))
         .extract()
-        .unwrap_or_default()
+        .map_err(|e| ConfigError::Load(Box::new(e)))?;
+    cfg.validate()?;
+    Ok(cfg)
 }
 
 #[cfg(test)]
@@ -66,6 +125,8 @@ mod tests {
         assert!(!cfg.policy_file.is_empty());
         assert!(!cfg.profile_path.is_empty());
         assert!(!cfg.ipc_socket.is_empty());
+        assert!(cfg.ipc_require_same_user);
+        assert!(!cfg.allow_insecure_placeholder_key);
     }
 
     #[test]
