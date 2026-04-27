@@ -21,6 +21,12 @@ impl LinuxCapture {
     }
 }
 
+impl Default for LinuxCapture {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 fn find_keyboard_devices() -> Vec<Device> {
     let mut keyboards = Vec::new();
     if let Ok(entries) = std::fs::read_dir("/dev/input") {

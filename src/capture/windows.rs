@@ -43,6 +43,12 @@ impl WindowsCapture {
     }
 }
 
+impl Default for WindowsCapture {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Window procedure for the message-only Raw Input window.
 ///
 /// SAFETY: Called by the OS; must follow Win32 calling conventions.
