@@ -4,6 +4,7 @@ pub mod config;
 pub mod events;
 pub mod features;
 pub mod ipc;
+pub mod keystore;
 pub mod monitoring;
 pub mod policy;
 pub mod risk;

@@ -9,7 +9,7 @@ const DELETE: u32 = 111; // Linux evdev key code for delete
 pub struct FeatureVector {
     pub dwell_times: Vec<f64>,
     pub flight_times: Vec<f64>,
-    pub digraph_latencies: HashMap<String, f64>,
+    pub digraph_latencies: HashMap<u64, f64>,
     pub wpm: f64,
     pub speed_variance: f64,
     pub error_rate: f64,
@@ -66,16 +66,23 @@ fn stddev(v: &[f64]) -> f64 {
     variance.sqrt()
 }
 
+fn digraph_key(a: u32, b: u32) -> u64 {
+    ((a as u64) << 32) | (b as u64)
+}
+
 pub struct FeatureExtractor;
 
 impl FeatureExtractor {
     pub fn extract(events: &[KeystrokeEvent]) -> FeatureVector {
-        let mut dwell_times = Vec::new();
-        let mut flight_times = Vec::new();
-        let mut digraph_latencies: HashMap<String, f64> = HashMap::new();
+        // Pre-allocate based on expected number of key-down events (~half the slice)
+        let cap = (events.len() / 2).max(8);
+        let mut dwell_times = Vec::with_capacity(cap);
+        let mut flight_times = Vec::with_capacity(cap);
+        // Cap digraph map at 256 unique bigrams to bound memory for huge windows
+        let mut digraph_latencies: HashMap<u64, f64> = HashMap::with_capacity(cap.min(256));
 
-        // Track key down times per key code
-        let mut key_down_times: HashMap<u32, u64> = HashMap::new();
+        // Track key down times per key code — rarely more than ~10 simultaneous
+        let mut key_down_times: HashMap<u32, u64> = HashMap::with_capacity(16);
         // Track last key up event
         let mut last_key_up: Option<(u32, u64)> = None;
         // For digraph: last key down
@@ -86,7 +93,7 @@ impl FeatureExtractor {
         let mut immediate_corrections = 0u32;
         let mut deliberate_corrections = 0u32;
 
-        let mut inter_key_intervals: Vec<f64> = Vec::new();
+        let mut inter_key_intervals: Vec<f64> = Vec::with_capacity(cap);
 
         for event in events {
             match event.event_type {
@@ -131,8 +138,8 @@ impl FeatureExtractor {
                         let latency_ms =
                             (event.timestamp_ns.saturating_sub(prev_ts)) as f64 / 1_000_000.0;
                         if (0.0..2000.0).contains(&latency_ms) {
-                            let key = format!("{}-{}", prev_code, event.key_code);
-                            digraph_latencies.insert(key, latency_ms);
+                            digraph_latencies
+                                .insert(digraph_key(prev_code, event.key_code), latency_ms);
                         }
                     }
 
@@ -261,6 +268,22 @@ mod tests {
             deliberate_correction_rate: 0.2,
         };
         assert_eq!(fv.to_vec().len(), 9);
+    }
+
+    #[test]
+    fn test_digraph_latencies_populated() {
+        // Two consecutive key-down events produce one digraph entry
+        let events = vec![
+            make_event(30, EventType::KeyDown, 0),
+            make_event(30, EventType::KeyUp, 30_000_000),
+            make_event(31, EventType::KeyDown, 50_000_000),
+            make_event(31, EventType::KeyUp, 80_000_000),
+        ];
+        let fv = FeatureExtractor::extract(&events);
+        let key = digraph_key(30, 31);
+        assert!(fv.digraph_latencies.contains_key(&key));
+        // Latency = (50 - 0) ms = 50 ms
+        assert!((fv.digraph_latencies[&key] - 50.0).abs() < 0.1);
     }
 
     #[test]

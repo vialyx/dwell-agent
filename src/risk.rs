@@ -120,7 +120,7 @@ mod tests {
         let mut profile = BaselineProfile::new(9, 0.05);
         // Warm up profile with consistent values
         for _ in 0..100 {
-            profile.update(&[100.0, 10.0, 50.0, 5.0, 60.0, 8.0, 0.05, 0.3, 0.2]);
+            profile.update(&[100.0, 10.0, 50.0, 5.0, 60.0, 8.0, 0.05, 0.3, 0.2], 50);
         }
         let scorer = RiskScorer::new(5.0, 1.0);
         // Using the same values should give low distance
@@ -142,7 +142,7 @@ mod tests {
     fn test_risk_score_extreme_anomaly() {
         let mut profile = BaselineProfile::new(9, 0.05);
         for _ in 0..100 {
-            profile.update(&[100.0, 10.0, 50.0, 5.0, 60.0, 8.0, 0.05, 0.3, 0.2]);
+            profile.update(&[100.0, 10.0, 50.0, 5.0, 60.0, 8.0, 0.05, 0.3, 0.2], 50);
         }
         let scorer = RiskScorer::new(2.0, 1.0);
         // Completely different features
@@ -180,7 +180,7 @@ mod tests {
     fn test_anomalous_features_detected() {
         let mut profile = BaselineProfile::new(9, 0.05);
         for _ in 0..200 {
-            profile.update(&[100.0, 10.0, 50.0, 5.0, 60.0, 8.0, 0.05, 0.3, 0.2]);
+            profile.update(&[100.0, 10.0, 50.0, 5.0, 60.0, 8.0, 0.05, 0.3, 0.2], 50);
         }
 
         let scorer = RiskScorer::new(2.0, 1.0);

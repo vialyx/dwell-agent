@@ -39,7 +39,13 @@ impl BaselineProfile {
         }
     }
 
-    pub fn update(&mut self, features: &[f64]) {
+    /// Update the EMA model with a new feature vector.
+    ///
+    /// `keystroke_count` should be the number of `KeyDown` events that produced
+    /// this feature vector.  It is added to `enrollment_count` so that
+    /// `is_enrolled()` compares against real keystroke counts rather than the
+    /// (fixed) feature-vector dimension.
+    pub fn update(&mut self, features: &[f64], keystroke_count: usize) {
         let alpha = self.ema_alpha;
         for (i, &x) in features.iter().enumerate() {
             if i >= self.feature_means.len() {
@@ -56,7 +62,7 @@ impl BaselineProfile {
             let new_var = (1.0 - alpha) * (old_var + alpha * diff * diff);
             self.feature_stds[i] = new_var.sqrt().max(1e-6);
         }
-        self.enrollment_count += features.len();
+        self.enrollment_count += keystroke_count;
     }
 
     pub fn is_enrolled(&self, min_keystrokes: usize) -> bool {
@@ -110,7 +116,7 @@ mod tests {
     #[test]
     fn test_update_changes_means() {
         let mut profile = BaselineProfile::new(3, 0.1);
-        profile.update(&[10.0, 20.0, 30.0]);
+        profile.update(&[10.0, 20.0, 30.0], 3);
         // After one update with alpha=0.1: mean = 0.1*x + 0.9*0 = 0.1*x
         assert!((profile.feature_means[0] - 1.0).abs() < 0.01);
         assert!((profile.feature_means[1] - 2.0).abs() < 0.01);
@@ -118,24 +124,34 @@ mod tests {
     }
 
     #[test]
-    fn test_is_enrolled() {
+    fn test_is_enrolled_tracks_keystroke_count_not_feature_dim() {
         let mut profile = BaselineProfile::new(3, 0.1);
-        assert!(!profile.is_enrolled(10));
-        profile.update(&[1.0, 2.0, 3.0]);
-        // enrollment_count increases by features.len() = 3
-        assert!(!profile.is_enrolled(10));
-        // update 3 more times: 4*3 = 12 >= 10
-        profile.update(&[1.0, 2.0, 3.0]);
-        profile.update(&[1.0, 2.0, 3.0]);
-        profile.update(&[1.0, 2.0, 3.0]);
-        assert!(profile.is_enrolled(10));
+        assert!(!profile.is_enrolled(100));
+        // Pass keystroke_count=40 — still below threshold
+        profile.update(&[1.0, 2.0, 3.0], 40);
+        assert!(!profile.is_enrolled(100));
+        // Another 60 → total 100 >= 100
+        profile.update(&[1.0, 2.0, 3.0], 60);
+        assert!(profile.is_enrolled(100));
+        // Verify the count is exactly 100, not inflated by feature_dim (3)
+        assert_eq!(profile.enrollment_count, 100);
+    }
+
+    #[test]
+    fn test_enrollment_count_reflects_keystrokes_not_feature_dim() {
+        // Feature vector has dim 9; each update should add real keystroke count
+        let mut profile = BaselineProfile::new(9, 0.05);
+        profile.update(&[0.0; 9], 50);
+        profile.update(&[0.0; 9], 50);
+        // Should be 100, not 9*2=18
+        assert_eq!(profile.enrollment_count, 100);
     }
 
     #[test]
     fn test_encrypt_decrypt_roundtrip() {
         let key = [42u8; 32];
         let mut profile = BaselineProfile::new(3, 0.05);
-        profile.update(&[100.0, 50.0, 30.0]);
+        profile.update(&[100.0, 50.0, 30.0], 50);
         let encrypted = profile.to_encrypted_bytes(&key).unwrap();
         let decrypted = BaselineProfile::from_encrypted_bytes(&encrypted, &key).unwrap();
         assert_eq!(profile.feature_means.len(), decrypted.feature_means.len());
@@ -146,5 +162,24 @@ mod tests {
         {
             assert!((a - b).abs() < 1e-9);
         }
+    }
+
+    #[test]
+    fn test_invalid_data_too_short() {
+        let key = [1u8; 32];
+        let result = BaselineProfile::from_encrypted_bytes(&[0u8; 4], &key);
+        assert!(matches!(result, Err(BaselineError::InvalidData)));
+    }
+
+    #[test]
+    fn test_wrong_key_fails_decryption() {
+        let key_a = [0xABu8; 32];
+        let key_b = [0xCDu8; 32];
+        let profile = BaselineProfile::new(3, 0.05);
+        let encrypted = profile.to_encrypted_bytes(&key_a).unwrap();
+        assert!(matches!(
+            BaselineProfile::from_encrypted_bytes(&encrypted, &key_b),
+            Err(BaselineError::Decryption)
+        ));
     }
 }

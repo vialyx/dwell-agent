@@ -1,9 +1,10 @@
 use dwell_agent::baseline::BaselineProfile;
 use dwell_agent::capture::create_capture;
 use dwell_agent::config::load_config;
-use dwell_agent::events::KeystrokeEvent;
+use dwell_agent::events::{EventType, KeystrokeEvent};
 use dwell_agent::features::FeatureExtractor;
 use dwell_agent::ipc::IpcServer;
+use dwell_agent::keystore;
 use dwell_agent::monitoring::RuntimeStats;
 use dwell_agent::policy::PolicyEngine;
 use dwell_agent::risk;
@@ -18,9 +19,6 @@ use tokio::sync::{broadcast, mpsc};
 use tracing::{error, info, warn};
 use tracing_subscriber::fmt;
 use uuid::Uuid;
-
-// Hardcoded key for demo - in production, derive from OS keychain
-const PROFILE_KEY: [u8; 32] = [0x42u8; 32];
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -39,12 +37,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Starting dwell-agent");
 
+    let profile_key = keystore::derive_profile_key();
+
     let session_id = Uuid::new_v4();
     info!(?session_id, "Session started");
     let stats = Arc::new(RuntimeStats::new());
 
     // Load or create baseline profile
-    let profile = match BaselineProfile::load(&config.profile_path, &PROFILE_KEY) {
+    let profile = match BaselineProfile::load(&config.profile_path, &profile_key) {
         Ok(p) => {
             info!(
                 "Loaded existing profile with {} enrollment keystrokes",
@@ -111,8 +111,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let fv = FeatureExtractor::extract(&events);
                 let feature_vec = fv.to_vec();
 
-                let mut p = profile_clone.lock().unwrap();
-                p.update(&feature_vec);
+                // Count actual KeyDown events for correct enrollment accounting
+                let keystroke_count = events
+                    .iter()
+                    .filter(|e| e.event_type == EventType::KeyDown)
+                    .count();
+
+                let mut p = profile_clone.lock().unwrap_or_else(|p| p.into_inner());
+                p.update(&feature_vec, keystroke_count);
 
                 if p.is_enrolled(min_enrollment) {
                     let risk_event =
@@ -264,8 +270,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Graceful shutdown: flush profile
     capture.stop();
-    let p = profile.lock().unwrap();
-    if let Err(e) = p.save(&profile_path, &PROFILE_KEY) {
+    let p = profile.lock().unwrap_or_else(|p| p.into_inner());
+    if let Err(e) = p.save(&profile_path, &profile_key) {
         error!("Failed to save profile: {}", e);
     } else {
         info!("Profile saved");

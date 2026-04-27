@@ -136,7 +136,8 @@ impl PolicyEngine {
     }
 
     pub fn evaluate(&self, risk_score: u8) -> Vec<PolicyAction> {
-        let config = self.config.read().unwrap();
+        // unwrap_or_else: recover from a poisoned lock by using the inner value
+        let config = self.config.read().unwrap_or_else(|p| p.into_inner());
         let tier = if risk_score <= config.tiers.low_max {
             RiskTier::Low
         } else if risk_score <= config.tiers.med_max {
@@ -159,9 +160,8 @@ impl PolicyEngine {
 
     pub fn reload(&self, policy_file: &str) -> Result<(), PolicyError> {
         let new_config = load_policy_config(policy_file)?;
-        if let Ok(mut w) = self.config.write() {
-            *w = new_config;
-        }
+        let mut w = self.config.write().unwrap_or_else(|p| p.into_inner());
+        *w = new_config;
         Ok(())
     }
 }
