@@ -1,9 +1,9 @@
-use std::collections::HashMap;
 use crate::events::{EventType, KeystrokeEvent};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
-const BACKSPACE: u32 = 14;   // Linux evdev key code for backspace
-const DELETE: u32 = 111;     // Linux evdev key code for delete
+const BACKSPACE: u32 = 14; // Linux evdev key code for backspace
+const DELETE: u32 = 111; // Linux evdev key code for delete
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FeatureVector {
@@ -46,20 +46,6 @@ impl FeatureVector {
             self.error_rate,
             self.immediate_correction_rate,
             self.deliberate_correction_rate,
-        ]
-    }
-
-    pub fn feature_names() -> Vec<FeatureName> {
-        vec![
-            FeatureName::MeanDwellTime,
-            FeatureName::StdDwellTime,
-            FeatureName::MeanFlightTime,
-            FeatureName::StdFlightTime,
-            FeatureName::Wpm,
-            FeatureName::SpeedVariance,
-            FeatureName::ErrorRate,
-            FeatureName::ImmediateCorrectionRate,
-            FeatureName::DeliberateCorrectionRate,
         ]
     }
 }
@@ -112,7 +98,8 @@ impl FeatureExtractor {
                         error_keys += 1;
                         // Check timing relative to last key down
                         if let Some((_, last_ts)) = last_key_down {
-                            let delta_ms = (event.timestamp_ns.saturating_sub(last_ts)) as f64 / 1_000_000.0;
+                            let delta_ms =
+                                (event.timestamp_ns.saturating_sub(last_ts)) as f64 / 1_000_000.0;
                             if delta_ms < 200.0 {
                                 immediate_corrections += 1;
                             } else if delta_ms > 500.0 {
@@ -123,24 +110,27 @@ impl FeatureExtractor {
 
                     // Flight time: time from last key up to this key down
                     if let Some((_, up_ts)) = last_key_up {
-                        let flight_ms = (event.timestamp_ns.saturating_sub(up_ts)) as f64 / 1_000_000.0;
-                        if flight_ms >= 0.0 && flight_ms < 2000.0 {
+                        let flight_ms =
+                            (event.timestamp_ns.saturating_sub(up_ts)) as f64 / 1_000_000.0;
+                        if (0.0..2000.0).contains(&flight_ms) {
                             flight_times.push(flight_ms);
                         }
                     }
 
                     // Inter-key interval: time between consecutive key downs
                     if let Some((_, last_down_ts)) = last_key_down {
-                        let interval_ms = (event.timestamp_ns.saturating_sub(last_down_ts)) as f64 / 1_000_000.0;
-                        if interval_ms >= 0.0 && interval_ms < 2000.0 {
+                        let interval_ms =
+                            (event.timestamp_ns.saturating_sub(last_down_ts)) as f64 / 1_000_000.0;
+                        if (0.0..2000.0).contains(&interval_ms) {
                             inter_key_intervals.push(interval_ms);
                         }
                     }
 
                     // Digraph: time between consecutive key down events
                     if let Some((prev_code, prev_ts)) = last_key_down {
-                        let latency_ms = (event.timestamp_ns.saturating_sub(prev_ts)) as f64 / 1_000_000.0;
-                        if latency_ms >= 0.0 && latency_ms < 2000.0 {
+                        let latency_ms =
+                            (event.timestamp_ns.saturating_sub(prev_ts)) as f64 / 1_000_000.0;
+                        if (0.0..2000.0).contains(&latency_ms) {
                             let key = format!("{}-{}", prev_code, event.key_code);
                             digraph_latencies.insert(key, latency_ms);
                         }
@@ -151,8 +141,9 @@ impl FeatureExtractor {
                 }
                 EventType::KeyUp => {
                     if let Some(&down_ts) = key_down_times.get(&event.key_code) {
-                        let dwell_ms = (event.timestamp_ns.saturating_sub(down_ts)) as f64 / 1_000_000.0;
-                        if dwell_ms >= 0.0 && dwell_ms < 1000.0 {
+                        let dwell_ms =
+                            (event.timestamp_ns.saturating_sub(down_ts)) as f64 / 1_000_000.0;
+                        if (0.0..1000.0).contains(&dwell_ms) {
                             dwell_times.push(dwell_ms);
                         }
                         key_down_times.remove(&event.key_code);
@@ -209,9 +200,9 @@ impl FeatureExtractor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::EventType;
     use proptest::prelude::*;
     use uuid::Uuid;
-    use crate::events::EventType;
 
     fn make_event(key_code: u32, event_type: EventType, timestamp_ns: u64) -> KeystrokeEvent {
         KeystrokeEvent {
@@ -270,6 +261,40 @@ mod tests {
             deliberate_correction_rate: 0.2,
         };
         assert_eq!(fv.to_vec().len(), 9);
+    }
+
+    #[test]
+    fn test_immediate_and_deliberate_correction_rates() {
+        let events = vec![
+            make_event(30, EventType::KeyDown, 0),
+            make_event(30, EventType::KeyUp, 30_000_000),
+            // immediate correction (< 200ms)
+            make_event(BACKSPACE, EventType::KeyDown, 100_000_000),
+            make_event(BACKSPACE, EventType::KeyUp, 130_000_000),
+            make_event(31, EventType::KeyDown, 1_000_000_000),
+            make_event(31, EventType::KeyUp, 1_030_000_000),
+            // deliberate correction (> 500ms)
+            make_event(DELETE, EventType::KeyDown, 1_700_000_000),
+            make_event(DELETE, EventType::KeyUp, 1_730_000_000),
+        ];
+
+        let fv = FeatureExtractor::extract(&events);
+        assert!((fv.error_rate - 0.5).abs() < 0.01);
+        assert!((fv.immediate_correction_rate - 0.5).abs() < 0.01);
+        assert!((fv.deliberate_correction_rate - 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_outlier_intervals_are_filtered() {
+        let events = vec![
+            make_event(30, EventType::KeyDown, 0),
+            make_event(30, EventType::KeyUp, 2_500_000_000), // 2500ms dwell -> filtered
+            make_event(31, EventType::KeyDown, 5_100_000_000), // 2600ms flight -> filtered
+        ];
+
+        let fv = FeatureExtractor::extract(&events);
+        assert!(fv.dwell_times.is_empty());
+        assert!(fv.flight_times.is_empty());
     }
 
     proptest! {

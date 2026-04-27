@@ -1,20 +1,14 @@
-mod baseline;
-mod capture;
-mod config;
-mod events;
-mod features;
-mod ipc;
-mod policy;
-mod risk;
-
-use baseline::BaselineProfile;
-use capture::create_capture;
-use config::load_config;
-use events::KeystrokeEvent;
-use features::FeatureExtractor;
-use ipc::IpcServer;
-use policy::PolicyEngine;
-use risk::RiskScorer;
+use dwell_agent::baseline::BaselineProfile;
+use dwell_agent::capture::create_capture;
+use dwell_agent::config::load_config;
+use dwell_agent::events::KeystrokeEvent;
+use dwell_agent::features::FeatureExtractor;
+use dwell_agent::ipc::IpcServer;
+use dwell_agent::monitoring::RuntimeStats;
+use dwell_agent::policy::PolicyEngine;
+use dwell_agent::risk;
+use dwell_agent::risk::RiskScorer;
+use dwell_agent::webhook;
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -47,11 +41,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let session_id = Uuid::new_v4();
     info!(?session_id, "Session started");
+    let stats = Arc::new(RuntimeStats::new());
 
     // Load or create baseline profile
     let profile = match BaselineProfile::load(&config.profile_path, &PROFILE_KEY) {
         Ok(p) => {
-            info!("Loaded existing profile with {} enrollment keystrokes", p.enrollment_count);
+            info!(
+                "Loaded existing profile with {} enrollment keystrokes",
+                p.enrollment_count
+            );
             p
         }
         Err(_) => {
@@ -74,13 +72,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let capture = create_capture();
     info!("Starting keystroke capture");
     if let Err(e) = capture.start(keystroke_tx.clone()).await {
-        warn!("Capture start failed: {} (this is expected in CI/non-interactive environments)", e);
+        warn!(
+            "Capture start failed: {} (this is expected in CI/non-interactive environments)",
+            e
+        );
     }
 
     // Feature extraction and risk scoring loop
     let profile_clone = profile.clone();
     let config_clone = config.clone();
     let risk_tx_clone = risk_tx.clone();
+    let stats_clone = stats.clone();
     let window_size = config.window_size;
     let min_enrollment = config.min_enrollment_keystrokes;
 
@@ -94,6 +96,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         loop {
             match keystroke_rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(event) => {
+                    stats_clone.inc_keystrokes_seen();
                     window.push_back(event);
                     if window.len() > window_size {
                         window.pop_front();
@@ -112,18 +115,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 p.update(&feature_vec);
 
                 if p.is_enrolled(min_enrollment) {
-                    let risk_event = risk_scorer.score(
-                        session_id,
-                        &feature_vec,
-                        &p,
-                        events.len() as u32,
-                    );
+                    let risk_event =
+                        risk_scorer.score(session_id, &feature_vec, &p, events.len() as u32);
                     info!(
                         risk_score = risk_event.risk_score,
                         confidence = risk_event.confidence,
                         "Risk assessment"
                     );
                     let _ = risk_tx_clone.send(risk_event);
+                    stats_clone.inc_risk_events_emitted();
                 }
 
                 last_emit = std::time::Instant::now();
@@ -142,11 +142,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Policy evaluation task
     let policy_clone = policy_engine.clone();
+    let policy_stats = stats.clone();
     let mut policy_risk_rx = risk_tx.subscribe();
     let policy_task = tokio::spawn(async move {
         loop {
             match policy_risk_rx.recv().await {
                 Ok(event) => {
+                    policy_stats.inc_policy_evaluations();
                     let actions = policy_clone.evaluate(event.risk_score);
                     info!(?actions, risk_score = event.risk_score, "Policy actions");
                 }
@@ -166,13 +168,82 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // Optional webhook dispatcher
+    let webhook_task = config
+        .webhook_url
+        .as_ref()
+        .and_then(|u| {
+            let trimmed = u.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        })
+        .map(|url| {
+            let webhook_risk_rx = risk_tx.subscribe();
+            let webhook_stats = stats.clone();
+            let min_risk = config.webhook_min_risk_score;
+            let timeout_secs = config.webhook_timeout_secs;
+            tokio::spawn(async move {
+                webhook::run_webhook_dispatcher(
+                    url,
+                    min_risk,
+                    timeout_secs,
+                    webhook_risk_rx,
+                    webhook_stats,
+                )
+                .await;
+            })
+        });
+
+    // Periodic health/monitoring logs
+    let health_stats = stats.clone();
+    let metrics_log_interval_secs = config.metrics_log_interval_secs.max(1);
+    let health_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(metrics_log_interval_secs));
+        loop {
+            interval.tick().await;
+            let snapshot = health_stats.snapshot();
+            info!(
+                uptime_secs = snapshot.uptime_secs,
+                keystrokes_seen = snapshot.keystrokes_seen,
+                risk_events_emitted = snapshot.risk_events_emitted,
+                policy_evaluations = snapshot.policy_evaluations,
+                commands_received = snapshot.commands_received,
+                webhook_deliveries = snapshot.webhook_deliveries,
+                webhook_failures = snapshot.webhook_failures,
+                "Runtime health"
+            );
+        }
+    });
+
     // Command handler
     let profile_path = config.profile_path.clone();
+    let policy_file_for_cmd = config.policy_file.clone();
+    let policy_engine_for_cmd = policy_engine.clone();
+    let stats_for_cmd = stats.clone();
     let cmd_task = tokio::spawn(async move {
         while let Some(cmd) = cmd_rx.recv().await {
+            stats_for_cmd.inc_commands_received();
             match cmd.trim() {
-                "status" => info!("Status: running"),
-                "reload-policy" => info!("Policy reload requested"),
+                "status" => {
+                    let snapshot = stats_for_cmd.snapshot();
+                    info!(
+                        uptime_secs = snapshot.uptime_secs,
+                        keystrokes_seen = snapshot.keystrokes_seen,
+                        risk_events_emitted = snapshot.risk_events_emitted,
+                        policy_evaluations = snapshot.policy_evaluations,
+                        commands_received = snapshot.commands_received,
+                        webhook_deliveries = snapshot.webhook_deliveries,
+                        webhook_failures = snapshot.webhook_failures,
+                        "Status: running"
+                    );
+                }
+                "reload-policy" => match policy_engine_for_cmd.reload(&policy_file_for_cmd) {
+                    Ok(()) => info!("Policy reloaded from {}", policy_file_for_cmd),
+                    Err(e) => warn!("Policy reload failed: {}", e),
+                },
                 _ => warn!("Unknown command: {}", cmd),
             }
         }
@@ -203,6 +274,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ipc_task.abort();
     policy_task.abort();
     cmd_task.abort();
+    health_task.abort();
+    if let Some(handle) = webhook_task {
+        handle.abort();
+    }
     scoring_task.abort();
 
     info!("dwell-agent stopped");

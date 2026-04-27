@@ -1,8 +1,8 @@
 use crate::baseline::BaselineProfile;
 use crate::features::FeatureName;
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use chrono::Utc;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RiskEvent {
@@ -32,13 +32,13 @@ impl RiskScorer {
         baseline: &BaselineProfile,
         window_keystrokes: u32,
     ) -> RiskEvent {
-        let distance = mahalanobis_distance(features, &baseline.feature_means, &baseline.feature_stds);
+        let distance =
+            mahalanobis_distance(features, &baseline.feature_means, &baseline.feature_stds);
         let risk_raw = sigmoid(self.k * (distance - self.threshold)) * 100.0;
         let risk_score = risk_raw.clamp(0.0, 100.0) as u8;
 
         let confidence = if baseline.enrollment_count > 0 {
-            ((window_keystrokes as f64) / (baseline.enrollment_count as f64))
-                .min(1.0) as f32
+            ((window_keystrokes as f64) / (baseline.enrollment_count as f64)).min(1.0) as f32
         } else {
             0.0f32
         };
@@ -131,7 +131,11 @@ mod tests {
             50,
         );
         // Identical features should yield low risk score
-        assert!(event.risk_score < 50, "Expected low risk but got {}", event.risk_score);
+        assert!(
+            event.risk_score < 50,
+            "Expected low risk but got {}",
+            event.risk_score
+        );
     }
 
     #[test]
@@ -148,14 +152,18 @@ mod tests {
             &profile,
             50,
         );
-        assert!(event.risk_score > 50, "Expected high risk but got {}", event.risk_score);
+        assert!(
+            event.risk_score > 50,
+            "Expected high risk but got {}",
+            event.risk_score
+        );
     }
 
     #[test]
     fn test_sigmoid_range() {
         for x in [-10.0, -1.0, 0.0, 1.0, 10.0] {
             let s = sigmoid(x);
-            assert!(s >= 0.0 && s <= 1.0);
+            assert!((0.0..=1.0).contains(&s));
         }
     }
 
@@ -166,5 +174,23 @@ mod tests {
         let stds = vec![1.0, 1.0, 1.0];
         let dist = mahalanobis_distance(&features, &means, &stds);
         assert!(dist.abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_anomalous_features_detected() {
+        let mut profile = BaselineProfile::new(9, 0.05);
+        for _ in 0..200 {
+            profile.update(&[100.0, 10.0, 50.0, 5.0, 60.0, 8.0, 0.05, 0.3, 0.2]);
+        }
+
+        let scorer = RiskScorer::new(2.0, 1.0);
+        let event = scorer.score(
+            Uuid::new_v4(),
+            &[100.0, 10.0, 50.0, 5.0, 260.0, 8.0, 0.05, 0.3, 0.2],
+            &profile,
+            50,
+        );
+
+        assert!(event.anomalous_features.contains(&FeatureName::Wpm));
     }
 }

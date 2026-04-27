@@ -8,3 +8,7 @@ policy_file = "policy.toml"
 profile_path = "profile.enc"
 log_level = "info"
 ipc_socket = "/tmp/dwell-agent.sock"
+webhook_url = ""
+webhook_min_risk_score = 0
+webhook_timeout_secs = 5
+metrics_log_interval_secs = 60

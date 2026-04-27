@@ -50,7 +50,9 @@ impl KeystrokeCapture for LinuxCapture {
 
         let mut devices = find_keyboard_devices();
         if devices.is_empty() {
-            return Err(CaptureError::Device("No keyboard devices found".to_string()));
+            return Err(CaptureError::Device(
+                "No keyboard devices found".to_string(),
+            ));
         }
 
         std::thread::spawn(move || {
@@ -66,7 +68,8 @@ impl KeystrokeCapture for LinuxCapture {
                                     0 => EventType::KeyUp,
                                     _ => continue,
                                 };
-                                let timestamp_ns = ev.timestamp()
+                                let timestamp_ns = ev
+                                    .timestamp()
                                     .duration_since(std::time::SystemTime::UNIX_EPOCH)
                                     .map(|d| d.as_nanos() as u64)
                                     .unwrap_or(0);

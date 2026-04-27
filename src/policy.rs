@@ -98,8 +98,8 @@ impl PolicyEngine {
         let config_clone = config.clone();
         let policy_file_owned = policy_file.to_string();
 
-        let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
-            match res {
+        let mut watcher =
+            notify::recommended_watcher(move |res: notify::Result<Event>| match res {
                 Ok(event) => {
                     if event.kind.is_modify() || event.kind.is_create() {
                         match load_policy_config(&policy_file_owned) {
@@ -116,8 +116,7 @@ impl PolicyEngine {
                     }
                 }
                 Err(e) => error!("Watch error: {}", e),
-            }
-        })?;
+            })?;
 
         if Path::new(policy_file).exists() {
             watcher.watch(Path::new(policy_file), RecursiveMode::NonRecursive)?;
@@ -176,6 +175,7 @@ fn load_policy_config(path: &str) -> Result<PolicyConfig, PolicyError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn default_engine() -> PolicyEngine {
         PolicyEngine {
@@ -230,5 +230,45 @@ mod tests {
         let actions = engine.evaluate(71);
         assert!(actions.contains(&PolicyAction::TriggerStepUp));
         assert!(actions.contains(&PolicyAction::TerminateSession));
+    }
+
+    #[test]
+    fn test_parse_action_unknown_returns_none() {
+        assert_eq!(parse_action("unknown_action"), None);
+    }
+
+    #[test]
+    fn test_reload_policy_from_file() {
+        let mut path = std::env::temp_dir();
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        path.push(format!("dwell-agent-policy-{suffix}.toml"));
+
+        let policy = r#"
+[tiers]
+low_max = 10
+med_max = 20
+
+[actions]
+low = ["log"]
+med = ["log", "emit_siem_tag"]
+high = ["terminate_session"]
+"#;
+
+        std::fs::write(&path, policy).expect("write temp policy");
+
+        let engine = default_engine();
+        engine
+            .reload(path.to_str().expect("utf8 path"))
+            .expect("reload policy");
+
+        let medium_actions = engine.evaluate(15);
+        assert!(medium_actions.contains(&PolicyAction::EmitSiemTag));
+        let high_actions = engine.evaluate(30);
+        assert_eq!(high_actions, vec![PolicyAction::TerminateSession]);
+
+        let _ = std::fs::remove_file(path);
     }
 }

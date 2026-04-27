@@ -1,8 +1,8 @@
+use aes_gcm::aead::rand_core::RngCore;
 use aes_gcm::{
     aead::{Aead, KeyInit, OsRng},
     Aes256Gcm, Nonce,
 };
-use aes_gcm::aead::rand_core::RngCore;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use thiserror::Error;
@@ -69,7 +69,9 @@ impl BaselineProfile {
         let mut nonce_bytes = [0u8; 12];
         OsRng.fill_bytes(&mut nonce_bytes);
         let nonce = Nonce::from_slice(&nonce_bytes);
-        let ciphertext = cipher.encrypt(nonce, plaintext.as_ref()).map_err(|_| BaselineError::Encryption)?;
+        let ciphertext = cipher
+            .encrypt(nonce, plaintext.as_ref())
+            .map_err(|_| BaselineError::Encryption)?;
         let mut result = nonce_bytes.to_vec();
         result.extend_from_slice(&ciphertext);
         Ok(result)
@@ -82,7 +84,9 @@ impl BaselineProfile {
         let (nonce_bytes, ciphertext) = data.split_at(12);
         let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| BaselineError::Decryption)?;
         let nonce = Nonce::from_slice(nonce_bytes);
-        let plaintext = cipher.decrypt(nonce, ciphertext).map_err(|_| BaselineError::Decryption)?;
+        let plaintext = cipher
+            .decrypt(nonce, ciphertext)
+            .map_err(|_| BaselineError::Decryption)?;
         let profile: Self = serde_json::from_slice(&plaintext)?;
         Ok(profile)
     }
@@ -135,7 +139,11 @@ mod tests {
         let encrypted = profile.to_encrypted_bytes(&key).unwrap();
         let decrypted = BaselineProfile::from_encrypted_bytes(&encrypted, &key).unwrap();
         assert_eq!(profile.feature_means.len(), decrypted.feature_means.len());
-        for (a, b) in profile.feature_means.iter().zip(decrypted.feature_means.iter()) {
+        for (a, b) in profile
+            .feature_means
+            .iter()
+            .zip(decrypted.feature_means.iter())
+        {
             assert!((a - b).abs() < 1e-9);
         }
     }
