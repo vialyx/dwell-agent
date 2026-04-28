@@ -8,9 +8,10 @@
 //! - IPC server command delivery and risk-event streaming
 //! - runtime statistics accumulation
 
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
+#[cfg(unix)]
+use std::path::Path;
 
 use dwell_agent::baseline::BaselineProfile;
 use dwell_agent::events::{EventType, KeystrokeEvent};
@@ -21,6 +22,7 @@ use dwell_agent::monitoring::RuntimeStats;
 use dwell_agent::policy::{PolicyAction, PolicyEngine};
 use dwell_agent::risk::{RiskEvent, RiskScorer};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+#[cfg(unix)]
 use tokio::net::UnixStream;
 use tokio::sync::broadcast;
 use tokio::time::{sleep, timeout};
@@ -61,6 +63,11 @@ fn key_down_count(events: &[KeystrokeEvent]) -> usize {
 fn unique_sock(label: &str) -> String {
     let id = &Uuid::new_v4().as_simple().to_string()[..10];
     format!("/tmp/dw-{label}-{id}.sock")
+}
+
+fn temp_file_path(label: &str, ext: &str) -> std::path::PathBuf {
+    let id = &Uuid::new_v4().as_simple().to_string()[..10];
+    std::env::temp_dir().join(format!("dw-{label}-{id}.{ext}"))
 }
 
 // ─── pipeline tests ───────────────────────────────────────────────────────────
@@ -181,15 +188,16 @@ fn test_policy_hot_reload_changes_tier_boundaries() {
     assert!(engine.evaluate(55).contains(&PolicyAction::EmitSiemTag));
 
     // Write a custom policy with narrow tiers
-    let id = &Uuid::new_v4().as_simple().to_string()[..10];
-    let path = format!("/tmp/dw-policy-{id}.toml");
+    let path = temp_file_path("policy", "toml");
     std::fs::write(
         &path,
         "[tiers]\nlow_max = 5\nmed_max = 10\n\n[actions]\nlow = [\"log\"]\nmed = [\"emit_siem_tag\"]\nhigh = [\"terminate_session\"]\n",
     )
     .unwrap();
 
-    engine.reload(&path).expect("policy reload");
+    engine
+        .reload(path.to_str().expect("temp policy path must be valid UTF-8"))
+        .expect("policy reload");
     // 55 → now High with the new tiers
     let actions = engine.evaluate(55);
     assert!(actions.contains(&PolicyAction::TerminateSession));
@@ -202,8 +210,7 @@ fn test_policy_hot_reload_changes_tier_boundaries() {
 #[test]
 fn test_profile_save_and_reload_roundtrip() {
     let key = PLACEHOLDER_KEY;
-    let id = &Uuid::new_v4().as_simple().to_string()[..10];
-    let path = format!("/tmp/dw-profile-{id}.enc");
+    let path = temp_file_path("profile", "enc");
 
     let mut profile = BaselineProfile::new(9, 0.05);
     for _ in 0..5 {
@@ -213,8 +220,12 @@ fn test_profile_save_and_reload_roundtrip() {
         profile.update(&fv.to_vec(), kd);
     }
 
-    profile.save(&path, &key).expect("save profile");
-    let loaded = BaselineProfile::load(&path, &key).expect("load profile");
+    let path_str = path
+        .to_str()
+        .expect("temp profile path must be valid UTF-8");
+
+    profile.save(path_str, &key).expect("save profile");
+    let loaded = BaselineProfile::load(path_str, &key).expect("load profile");
 
     assert_eq!(loaded.enrollment_count, profile.enrollment_count);
     assert_eq!(loaded.feature_means.len(), profile.feature_means.len());
@@ -233,12 +244,14 @@ fn test_profile_save_and_reload_roundtrip() {
 fn test_profile_wrong_key_fails_decryption() {
     let good_key = [0x11u8; 32];
     let bad_key = [0x22u8; 32];
-    let id = &Uuid::new_v4().as_simple().to_string()[..10];
-    let path = format!("/tmp/dw-wrongkey-{id}.enc");
+    let path = temp_file_path("wrongkey", "enc");
+    let path_str = path
+        .to_str()
+        .expect("temp wrong-key profile path must be valid UTF-8");
 
     let profile = BaselineProfile::new(3, 0.05);
-    profile.save(&path, &good_key).unwrap();
-    assert!(BaselineProfile::load(&path, &bad_key).is_err());
+    profile.save(path_str, &good_key).unwrap();
+    assert!(BaselineProfile::load(path_str, &bad_key).is_err());
     let _ = std::fs::remove_file(path);
 }
 
@@ -272,6 +285,7 @@ fn test_runtime_stats_pipeline_simulation() {
 
 /// IpcServer::new must clean up a stale socket file before binding.
 #[test]
+#[cfg(unix)]
 fn test_ipc_server_removes_stale_socket_on_init() {
     let path = unique_sock("stale");
     std::fs::write(&path, b"stale-data").unwrap();
@@ -284,6 +298,7 @@ fn test_ipc_server_removes_stale_socket_on_init() {
 
 /// Full async IPC round-trip: management command forwarding and risk-event JSON streaming.
 #[tokio::test]
+#[cfg(unix)]
 async fn test_ipc_command_and_risk_event_round_trip() {
     let socket_path = unique_sock("rt");
     let server = IpcServer::new(&socket_path, true).expect("create IPC server");
@@ -345,6 +360,7 @@ async fn test_ipc_command_and_risk_event_round_trip() {
 
 /// Multiple concurrent IPC clients each receive broadcast events independently.
 #[tokio::test]
+#[cfg(unix)]
 async fn test_ipc_multiple_clients_receive_events() {
     let socket_path = unique_sock("multi");
     let server = IpcServer::new(&socket_path, true).expect("create IPC server");
