@@ -18,7 +18,11 @@ pub struct ActionExecutor {
 }
 
 impl ActionExecutor {
-    pub fn new(hooks: ActionHooksConfig, action_hook_timeout_secs: u64, stats: Arc<RuntimeStats>) -> Self {
+    pub fn new(
+        hooks: ActionHooksConfig,
+        action_hook_timeout_secs: u64,
+        stats: Arc<RuntimeStats>,
+    ) -> Self {
         Self {
             hooks,
             action_hook_timeout_secs,
@@ -95,7 +99,12 @@ impl ActionExecutor {
             }
         };
 
-        match timeout(Duration::from_secs(self.action_hook_timeout_secs), child.wait()).await {
+        match timeout(
+            Duration::from_secs(self.action_hook_timeout_secs),
+            child.wait(),
+        )
+        .await
+        {
             Ok(Ok(status)) if status.success() => {
                 info!(
                     action = action_label(action),

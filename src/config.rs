@@ -260,7 +260,10 @@ mod tests {
             decoded.metrics_log_interval_secs,
             cfg.metrics_log_interval_secs
         );
-        assert_eq!(decoded.action_hook_timeout_secs, cfg.action_hook_timeout_secs);
+        assert_eq!(
+            decoded.action_hook_timeout_secs,
+            cfg.action_hook_timeout_secs
+        );
     }
 
     #[test]

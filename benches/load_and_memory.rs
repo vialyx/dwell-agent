@@ -1,4 +1,4 @@
-use criterion::{criterion_group, criterion_main, Criterion, BenchmarkId};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use dwell_agent::baseline::BaselineProfile;
 use dwell_agent::events::{EventType, KeystrokeEvent};
 use dwell_agent::features::FeatureExtractor;
@@ -62,9 +62,12 @@ fn bench_sustained_load(c: &mut Criterion) {
                             .count();
                         let fv = FeatureExtractor::extract(window);
                         profile.update(&fv.to_vec(), kd);
-                        criterion::black_box(
-                            scorer.score(session_id, &fv.to_vec(), &profile, kd as u32),
-                        );
+                        criterion::black_box(scorer.score(
+                            session_id,
+                            &fv.to_vec(),
+                            &profile,
+                            kd as u32,
+                        ));
                         start += window_size;
                     }
 
@@ -134,8 +137,7 @@ fn bench_webhook_spool_operations(c: &mut Criterion) {
 
                 b.iter(|| {
                     for event in &events {
-                        criterion::black_box(spool.enqueue(criterion::black_box(event)))
-                            .ok();
+                        criterion::black_box(spool.enqueue(criterion::black_box(event))).ok();
                     }
                 });
             },
