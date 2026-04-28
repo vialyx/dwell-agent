@@ -8,10 +8,10 @@
 //! - IPC server command delivery and risk-event streaming
 //! - runtime statistics accumulation
 
-use std::sync::Arc;
-use std::time::Duration;
 #[cfg(unix)]
 use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
 
 use dwell_agent::baseline::BaselineProfile;
 use dwell_agent::events::{EventType, KeystrokeEvent};
