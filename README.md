@@ -370,7 +370,7 @@ cargo test --all-targets --all-features
 cargo audit
 
 # generate an SBOM
-cargo cyclonedx --format json --output-file sbom.json
+cargo cyclonedx --format json --override-filename sbom.json
 
 # run with verbose logging
 DWELL_LOG_LEVEL=debug cargo run
