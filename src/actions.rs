@@ -1,6 +1,8 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::process::Command;
+use tokio::time::timeout;
 use tracing::{info, warn};
 
 use crate::config::ActionHooksConfig;
@@ -11,12 +13,17 @@ use crate::risk::RiskEvent;
 #[derive(Clone)]
 pub struct ActionExecutor {
     hooks: ActionHooksConfig,
+    action_hook_timeout_secs: u64,
     stats: Arc<RuntimeStats>,
 }
 
 impl ActionExecutor {
-    pub fn new(hooks: ActionHooksConfig, stats: Arc<RuntimeStats>) -> Self {
-        Self { hooks, stats }
+    pub fn new(hooks: ActionHooksConfig, action_hook_timeout_secs: u64, stats: Arc<RuntimeStats>) -> Self {
+        Self {
+            hooks,
+            action_hook_timeout_secs,
+            stats,
+        }
     }
 
     pub async fn execute_all(&self, actions: &[PolicyAction], event: &RiskEvent) {
@@ -74,8 +81,22 @@ impl ActionExecutor {
             .env("DWELL_CONFIDENCE", event.confidence.to_string())
             .env("DWELL_RISK_EVENT", event_json);
 
-        match command.status().await {
-            Ok(status) if status.success() => {
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(e) => {
+                warn!(
+                    action = action_label(action),
+                    error = %e,
+                    risk_score = event.risk_score,
+                    "Policy action hook failed to start"
+                );
+                self.stats.inc_action_failures();
+                return;
+            }
+        };
+
+        match timeout(Duration::from_secs(self.action_hook_timeout_secs), child.wait()).await {
+            Ok(Ok(status)) if status.success() => {
                 info!(
                     action = action_label(action),
                     exit_code = status.code(),
@@ -84,7 +105,7 @@ impl ActionExecutor {
                 );
                 self.stats.inc_action_successes();
             }
-            Ok(status) => {
+            Ok(Ok(status)) => {
                 warn!(
                     action = action_label(action),
                     exit_code = status.code(),
@@ -93,12 +114,28 @@ impl ActionExecutor {
                 );
                 self.stats.inc_action_failures();
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 warn!(
                     action = action_label(action),
                     error = %e,
                     risk_score = event.risk_score,
-                    "Policy action hook failed to start"
+                    "Policy action hook failed while running"
+                );
+                self.stats.inc_action_failures();
+            }
+            Err(_) => {
+                if let Err(e) = child.kill().await {
+                    warn!(
+                        action = action_label(action),
+                        error = %e,
+                        "Timed-out policy action hook kill failed"
+                    );
+                }
+                warn!(
+                    action = action_label(action),
+                    timeout_secs = self.action_hook_timeout_secs,
+                    risk_score = event.risk_score,
+                    "Policy action hook timed out"
                 );
                 self.stats.inc_action_failures();
             }
@@ -149,7 +186,7 @@ mod tests {
     #[tokio::test]
     async fn test_log_action_counts_as_success() {
         let stats = Arc::new(RuntimeStats::new());
-        let executor = ActionExecutor::new(ActionHooksConfig::default(), stats.clone());
+        let executor = ActionExecutor::new(ActionHooksConfig::default(), 5, stats.clone());
         executor
             .execute_all(&[PolicyAction::Log], &sample_event())
             .await;
@@ -162,7 +199,7 @@ mod tests {
     #[tokio::test]
     async fn test_missing_hook_is_skipped() {
         let stats = Arc::new(RuntimeStats::new());
-        let executor = ActionExecutor::new(ActionHooksConfig::default(), stats.clone());
+        let executor = ActionExecutor::new(ActionHooksConfig::default(), 5, stats.clone());
         executor
             .execute_all(&[PolicyAction::TriggerStepUp], &sample_event())
             .await;
@@ -175,12 +212,17 @@ mod tests {
     #[tokio::test]
     async fn test_hook_success_and_failure_are_counted() {
         let stats = Arc::new(RuntimeStats::new());
+        #[cfg(unix)]
+        let success_hook = vec!["true".to_string()];
+        #[cfg(windows)]
+        let success_hook = vec!["cmd".to_string(), "/C".to_string(), "exit 0".to_string()];
+
         let hooks = ActionHooksConfig {
-            trigger_step_up: Some(vec!["true".to_string()]),
+            trigger_step_up: Some(success_hook),
             terminate_session: Some(vec!["definitely-not-a-real-command".to_string()]),
             ..ActionHooksConfig::default()
         };
-        let executor = ActionExecutor::new(hooks, stats.clone());
+        let executor = ActionExecutor::new(hooks, 5, stats.clone());
         executor
             .execute_all(
                 &[PolicyAction::TriggerStepUp, PolicyAction::TerminateSession],
@@ -190,6 +232,32 @@ mod tests {
 
         let snap = stats.snapshot();
         assert_eq!(snap.action_successes, 1);
+        assert_eq!(snap.action_failures, 1);
+    }
+
+    #[tokio::test]
+    async fn test_timed_out_hook_is_counted_as_failure() {
+        let stats = Arc::new(RuntimeStats::new());
+        #[cfg(unix)]
+        let timeout_hook = vec!["sleep".to_string(), "2".to_string()];
+        #[cfg(windows)]
+        let timeout_hook = vec![
+            "powershell".to_string(),
+            "-NoProfile".to_string(),
+            "-Command".to_string(),
+            "Start-Sleep -Seconds 2".to_string(),
+        ];
+
+        let hooks = ActionHooksConfig {
+            terminate_session: Some(timeout_hook),
+            ..ActionHooksConfig::default()
+        };
+        let executor = ActionExecutor::new(hooks, 1, stats.clone());
+        executor
+            .execute_all(&[PolicyAction::TerminateSession], &sample_event())
+            .await;
+
+        let snap = stats.snapshot();
         assert_eq!(snap.action_failures, 1);
     }
 }

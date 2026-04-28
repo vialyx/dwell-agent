@@ -31,8 +31,11 @@ else {
 }
 
 if ($ClearProfileKey) {
-    [Environment]::SetEnvironmentVariable("DWELL_PROFILE_KEY", $null, "Machine")
-    Write-Host "Cleared machine-level DWELL_PROFILE_KEY."
+    $serviceRegPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName"
+    if (Test-Path -Path $serviceRegPath) {
+        Remove-ItemProperty -Path $serviceRegPath -Name "Environment" -ErrorAction SilentlyContinue
+        Write-Host "Cleared service-scoped DWELL_PROFILE_KEY environment."
+    }
 }
 
 if ($RemoveStateDir -and (Test-Path -Path $StateDir)) {

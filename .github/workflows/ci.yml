@@ -69,6 +69,17 @@ jobs:
       - name: Test
         run: cargo test --all-targets --all-features --verbose
 
+  # ─── windows build smoke (cross-platform support gate) ─────────────────────
+  windows-build:
+    name: Windows Build Smoke
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --all-targets --all-features --verbose
+
   # ─── benchmark compile smoke test ───────────────────────────────────────────
   bench-smoke:
     name: Bench Smoke

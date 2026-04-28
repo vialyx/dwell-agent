@@ -47,6 +47,7 @@ async fn handle_connection(
 }
 
 fn build_response(path: &str, snapshot: &RuntimeStatsSnapshot) -> String {
+    let ready = is_ready(snapshot);
     let (status_line, content_type, body) = match path {
         "/healthz" => (
             "HTTP/1.1 200 OK",
@@ -58,15 +59,19 @@ fn build_response(path: &str, snapshot: &RuntimeStatsSnapshot) -> String {
             }))
             .unwrap_or_else(|_| "{\"status\":\"ok\"}".to_string()),
         ),
-        "/readyz" => (
-            "HTTP/1.1 200 OK",
-            "application/json",
-            serde_json::to_string(&json!({
-                "ready": true,
+        "/readyz" => {
+            let status = if ready {
+                "HTTP/1.1 200 OK"
+            } else {
+                "HTTP/1.1 503 Service Unavailable"
+            };
+            let body = serde_json::to_string(&json!({
+                "ready": ready,
                 "degraded": is_degraded(snapshot),
             }))
-            .unwrap_or_else(|_| "{\"ready\":true}".to_string()),
-        ),
+            .unwrap_or_else(|_| "{\"ready\":false}".to_string());
+            (status, "application/json", body)
+        }
         "/metrics" => (
             "HTTP/1.1 200 OK",
             "text/plain; version=0.0.4",
@@ -90,6 +95,12 @@ fn is_degraded(snapshot: &RuntimeStatsSnapshot) -> bool {
         || snapshot.profile_load_failures > snapshot.profile_recoveries
         || snapshot.profile_save_failures > 0
         || snapshot.policy_reload_failures > 0
+}
+
+fn is_ready(snapshot: &RuntimeStatsSnapshot) -> bool {
+    snapshot.profile_save_failures == 0
+        && snapshot.profile_load_failures <= snapshot.profile_recoveries
+        && snapshot.policy_reload_failures == 0
 }
 
 pub fn render_prometheus_metrics(snapshot: &RuntimeStatsSnapshot) -> String {
@@ -247,7 +258,20 @@ mod tests {
         assert!(health.contains("HTTP/1.1 200 OK"));
         assert!(health.contains("\"status\":\"ok\""));
 
+        let ready = build_response("/readyz", &snapshot);
+        assert!(ready.contains("HTTP/1.1 200 OK"));
+        assert!(ready.contains("\"ready\":true"));
+
         let not_found = build_response("/does-not-exist", &snapshot);
         assert!(not_found.contains("HTTP/1.1 404 Not Found"));
+    }
+
+    #[test]
+    fn test_readyz_returns_503_when_not_ready() {
+        let stats = RuntimeStats::new();
+        stats.inc_profile_save_failures();
+        let not_ready = build_response("/readyz", &stats.snapshot());
+        assert!(not_ready.contains("HTTP/1.1 503 Service Unavailable"));
+        assert!(not_ready.contains("\"ready\":false"));
     }
 }

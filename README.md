@@ -180,6 +180,7 @@ The encryption key is handled separately by `DWELL_PROFILE_KEY`; it is **not** p
 | `webhook_min_risk_score` | `0` | Only send webhook events at/above this risk score |
 | `webhook_timeout_secs` | `5` | HTTP timeout for webhook delivery attempts |
 | `metrics_log_interval_secs` | `60` | Interval for periodic runtime health logs |
+| `action_hook_timeout_secs` | `15` | Max runtime for each policy action hook before forced termination |
 
 `webhook_url = ""` in the checked-in `dwell-agent.toml` effectively disables webhook delivery.
 
@@ -208,6 +209,8 @@ Each hook receives these environment variables:
 - `DWELL_RISK_SCORE`
 - `DWELL_CONFIDENCE`
 - `DWELL_RISK_EVENT`
+
+Hooks are bounded by `action_hook_timeout_secs`; long-running hooks are terminated and counted as failures.
 
 ---
 
@@ -285,7 +288,7 @@ The agent also exposes a loopback-only management API on `management_bind`:
 | Endpoint | Purpose |
 |---|---|
 | `GET /healthz` | Liveness + current runtime counters in JSON |
-| `GET /readyz` | Readiness status in JSON |
+| `GET /readyz` | Readiness status in JSON (`200` when ready, `503` when not ready) |
 | `GET /metrics` | Prometheus-compatible text metrics |
 
 ### Webhook payload
@@ -337,7 +340,7 @@ pwsh -File deploy/windows/uninstall-service.ps1 -RemoveStateDir
 Recommended production state layout:
 
 - profile and spool under a persistent state directory such as `/var/lib/dwell-agent`
-- environment file or wrapper script that injects `DWELL_PROFILE_KEY`
+- service-scoped secret injection for `DWELL_PROFILE_KEY` (avoid machine-wide env vars)
 - loopback-only management endpoint scraped by a local collector or reverse proxy sidecar
 
 ---

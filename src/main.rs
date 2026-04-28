@@ -237,6 +237,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::new(PolicyEngine::new(&config.policy_file).map_err(|e| format!("policy error: {e}"))?);
     let action_executor = Arc::new(ActionExecutor::new(
         config.action_hooks.clone(),
+        config.action_hook_timeout_secs,
         stats.clone(),
     ));
 

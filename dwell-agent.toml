@@ -18,6 +18,7 @@ webhook_spool_dir = "webhook-spool"
 webhook_min_risk_score = 0
 webhook_timeout_secs = 5
 metrics_log_interval_secs = 60
+action_hook_timeout_secs = 15
 
 # Optional command hooks for policy actions. Each hook is argv-style.
 # [action_hooks]

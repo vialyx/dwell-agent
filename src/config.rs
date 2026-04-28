@@ -32,6 +32,7 @@ pub struct AgentConfig {
     pub webhook_min_risk_score: u8,
     pub webhook_timeout_secs: u64,
     pub metrics_log_interval_secs: u64,
+    pub action_hook_timeout_secs: u64,
     #[serde(default)]
     pub action_hooks: ActionHooksConfig,
 }
@@ -59,6 +60,7 @@ impl Default for AgentConfig {
             webhook_min_risk_score: 0,
             webhook_timeout_secs: 5,
             metrics_log_interval_secs: 60,
+            action_hook_timeout_secs: 15,
             action_hooks: ActionHooksConfig::default(),
         }
     }
@@ -131,6 +133,11 @@ impl AgentConfig {
         if self.metrics_log_interval_secs == 0 {
             return Err(ConfigError::Validation(
                 "metrics_log_interval_secs must be > 0".to_string(),
+            ));
+        }
+        if self.action_hook_timeout_secs == 0 {
+            return Err(ConfigError::Validation(
+                "action_hook_timeout_secs must be > 0".to_string(),
             ));
         }
         if self.ipc_socket.trim().is_empty() {
@@ -253,6 +260,7 @@ mod tests {
             decoded.metrics_log_interval_secs,
             cfg.metrics_log_interval_secs
         );
+        assert_eq!(decoded.action_hook_timeout_secs, cfg.action_hook_timeout_secs);
     }
 
     #[test]

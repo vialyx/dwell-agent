@@ -24,6 +24,8 @@ Example install (elevated PowerShell):
 pwsh -File deploy/windows/install-service.ps1 -ExePath C:\path\to\dwell-agent.exe -ConfigPath C:\path\to\dwell-agent.toml -ProfileKey <64-char-hex> -StartAfterInstall
 ```
 
+The installer stores `DWELL_PROFILE_KEY` as a service-scoped environment value (not machine-wide) when `-ProfileKey` is provided.
+
 Example removal:
 
 ```powershell
@@ -42,7 +44,7 @@ pwsh -File deploy/windows/uninstall-service.ps1 -RemoveStateDir
 ## Health endpoints
 
 - `GET /healthz` returns JSON status plus current counters.
-- `GET /readyz` returns readiness status.
+- `GET /readyz` returns readiness status (`200` when ready, `503` when not ready).
 - `GET /metrics` returns Prometheus-compatible metrics.
 
 Default bind address: `127.0.0.1:9464`

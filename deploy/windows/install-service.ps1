@@ -20,6 +20,33 @@ function Assert-Admin {
     }
 }
 
+function Test-Hex64 {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Value
+    )
+
+    return $Value -match '^[0-9a-fA-F]{64}$'
+}
+
+function Protect-PathAcl {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    if (-not (Test-Path -Path $Path)) {
+        return
+    }
+
+    if ((Get-Item -Path $Path).PSIsContainer) {
+        & icacls.exe $Path /inheritance:r /grant:r "SYSTEM:(OI)(CI)F" "Administrators:(OI)(CI)F" | Out-Null
+    }
+    else {
+        & icacls.exe $Path /inheritance:r /grant:r "SYSTEM:F" "Administrators:F" | Out-Null
+    }
+}
+
 Assert-Admin
 
 $resolvedExePath = (Resolve-Path -Path $ExePath).Path
@@ -33,6 +60,7 @@ if (-not $resolvedExePath.ToLowerInvariant().EndsWith(".exe")) {
 
 New-Item -ItemType Directory -Path $StateDir -Force | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $StateDir "webhook-spool") -Force | Out-Null
+Protect-PathAcl -Path $StateDir
 
 $stateConfigPath = Join-Path $StateDir "dwell-agent.toml"
 if ($ConfigPath) {
@@ -42,13 +70,12 @@ if ($ConfigPath) {
 elseif (-not (Test-Path -Path $stateConfigPath -PathType Leaf)) {
     throw "No config present at '$stateConfigPath'. Pass -ConfigPath or place dwell-agent.toml in StateDir."
 }
+Protect-PathAcl -Path $stateConfigPath
 
 if ($ProfileKey) {
-    if ($ProfileKey.Length -ne 64) {
-        throw "ProfileKey must be a 64-character hex string."
+    if (-not (Test-Hex64 -Value $ProfileKey)) {
+        throw "ProfileKey must be a 64-character hex string ([0-9a-fA-F]{64})."
     }
-    [Environment]::SetEnvironmentVariable("DWELL_PROFILE_KEY", $ProfileKey, "Machine")
-    Write-Host "Set machine-level DWELL_PROFILE_KEY."
 }
 
 $runnerPath = Join-Path $StateDir "run-dwell-agent.ps1"
@@ -58,6 +85,7 @@ Set-Location -Path '$StateDir'
 & '$resolvedExePath'
 "@
 Set-Content -Path $runnerPath -Value $runnerContent -Encoding UTF8 -Force
+Protect-PathAcl -Path $runnerPath
 
 $service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
 if ($service) {
@@ -69,9 +97,15 @@ if ($service) {
     Start-Sleep -Seconds 1
 }
 
-$binPath = "\"$($PSHOME)\powershell.exe\" -NoProfile -ExecutionPolicy Bypass -File \"$runnerPath\""
+$binPath = "\"$($PSHOME)\powershell.exe\" -NoProfile -ExecutionPolicy RemoteSigned -File \"$runnerPath\""
 & sc.exe create $ServiceName binPath= $binPath start= auto DisplayName= $DisplayName | Out-Null
 & sc.exe description $ServiceName "Dwell Agent continuous authentication runtime" | Out-Null
+
+if ($ProfileKey) {
+    $serviceRegPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName"
+    New-ItemProperty -Path $serviceRegPath -Name "Environment" -PropertyType MultiString -Value @("DWELL_PROFILE_KEY=$ProfileKey") -Force | Out-Null
+    Write-Host "Set service-scoped DWELL_PROFILE_KEY in service registry environment."
+}
 
 Write-Host "Installed service '$ServiceName'."
 Write-Host "State directory: $StateDir"
